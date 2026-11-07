@@ -44,6 +44,12 @@ assert_eq!(&block[..], b"hello");
 Rows this crate does not interpret (named-session dependencies, marks, local
 entries, extra bitfield kinds, group rows) are never rewritten or dropped.
 
+Runtime memory budgets are shared across stores in a process: an 8 MiB block
+cache (including index/filter blocks) and a 32 MiB write-buffer manager, with
+two 8 MiB memtables per column family and at most 48 open files per DB. Each
+Corestore directory is one DB, not one DB per core or followed channel.
+These limits also apply to read-only opens; table/row formats are unchanged.
+
 ## Tests
 
 `cargo test` runs row-level round trips against the raw layout, including a
@@ -64,3 +70,9 @@ aarch64 Mac (`cargo run --release --example storage_bench -- <dir> 1024`, from
 
 Six runs, no `sync` in between; the spread is other builds on the same
 machine. The first, cold run wrote at 283 MiB/s.
+
+For a paced 256 MiB ingest (512 KiB values, 20 ms between eight-block bursts),
+three local arm64 Mac runs reduced peak memtables from 76 MiB to 12–16 MiB
+and maximum RSS from 103–105 MiB to 38–56 MiB. The measured RocksDB default
+cache capacity was 32 MiB per DB; the shared cache is 8 MiB total. Smaller
+flushes produced more table readers (7.6 KiB → 37.9 KiB in that workload).

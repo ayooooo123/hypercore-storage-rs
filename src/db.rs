@@ -1,25 +1,34 @@
-//! RocksDB open options that match npm `rocksdb-native`'s column family.
+//! RocksDB's JS-compatible table format with process-wide memory budgets.
 //!
-//! `hypercore-storage/index.js:1308-1330` asks for blob files from 4 KiB, a
-//! 256 MiB blob file, blob GC, 8 KiB table blocks, table format 6, a 10
-//! bits/key bloom filter, 7 levels, 2 write buffers of 64 MiB. The same options
-//! are set here so a Rust writer produces SSTs the JS reader expects and the
-//! reverse.
+//! Cache, memtable and file-handle limits are runtime-only: they change when
+//! tables flush, not the row encoding, table format, compression or checksums.
 
 use std::path::Path;
+use std::sync::LazyLock;
 
-use rocksdb::{BlockBasedOptions, DB, DBCompressionType, Options};
+use rocksdb::{BlockBasedOptions, Cache, DB, DBCompressionType, Options, WriteBufferManager};
 
 use crate::{Error, Result};
 
 /// The single non-default column family (`index.js:13`).
 pub const COLUMN_FAMILY: &str = "corestore";
 
+static BLOCK_CACHE: LazyLock<Cache> = LazyLock::new(|| Cache::new_lru_cache(8 * 1024 * 1024));
+static WRITE_BUFFERS: LazyLock<WriteBufferManager> =
+    LazyLock::new(|| WriteBufferManager::new_write_buffer_manager(32 * 1024 * 1024, true));
+
 pub(crate) fn open(path: &Path, read_only: bool) -> Result<DB> {
     let mut options = Options::default();
     options.create_if_missing(!read_only);
+    options.set_max_open_files(48);
+    options.set_write_buffer_manager(&WRITE_BUFFERS);
     let db = if read_only {
-        DB::open_cf_for_read_only(&options, path, [COLUMN_FAMILY], false)
+        DB::open_cf_with_opts_for_read_only(
+            &options,
+            path,
+            [(COLUMN_FAMILY, column_family())],
+            false,
+        )
     } else {
         options.create_missing_column_families(true);
         DB::open_cf_with_opts(&options, path, [(COLUMN_FAMILY, column_family())])
@@ -29,6 +38,7 @@ pub(crate) fn open(path: &Path, read_only: bool) -> Result<DB> {
 
 fn column_family() -> Options {
     let mut table = BlockBasedOptions::default();
+    table.set_block_cache(&BLOCK_CACHE);
     table.set_block_size(8192);
     table.set_format_version(6);
     table.set_cache_index_and_filter_blocks(true);
@@ -40,7 +50,7 @@ fn column_family() -> Options {
     options.set_block_based_table_factory(&table);
     options.set_num_levels(7);
     options.set_max_write_buffer_number(2);
-    options.set_write_buffer_size(64 * 1024 * 1024);
+    options.set_write_buffer_size(8 * 1024 * 1024);
     // JS writes with kNoCompression and XXH3 checksums; match both so the two
     // libraries produce the same tables (see docs/format.md).
     options.set_compression_type(DBCompressionType::None);
@@ -52,4 +62,29 @@ fn column_family() -> Options {
     options.set_blob_gc_force_threshold(1.0);
     options.set_blob_compression_type(DBCompressionType::None);
     options
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_memtables_flush_and_reopen_large_blocks() {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let value = vec![0x5a; 512 * 1024];
+        for dir in &dirs {
+            let db = open(dir.path(), false).unwrap();
+            let cf = db.cf_handle(COLUMN_FAMILY).unwrap();
+            for i in 0u64..48 {
+                db.put_cf(cf, i.to_be_bytes(), &value).unwrap();
+            }
+            db.flush_cf(cf).unwrap();
+            drop(db);
+            let db = open(dir.path(), true).unwrap();
+            let cf = db.cf_handle(COLUMN_FAMILY).unwrap();
+            for i in 0u64..48 {
+                assert_eq!(db.get_cf(cf, i.to_be_bytes()).unwrap().unwrap(), value);
+            }
+        }
+    }
 }
