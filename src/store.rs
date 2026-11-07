@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
 use compact_encoding::hypercore::Node;
-use rocksdb::{ColumnFamily, DB, IteratorMode, ReadOptions, WriteBatch};
+use rocksdb::{
+    BottommostLevelCompaction, ColumnFamily, CompactOptions, DB, IteratorMode, ReadOptions,
+    WriteBatch,
+};
 
 use crate::db::{self, COLUMN_FAMILY};
 use crate::keys;
@@ -31,7 +34,9 @@ pub struct Store {
 }
 
 struct Inner {
-    db: Mutex<Option<DB>>,
+    /// An `Arc` so a compaction can drop the lock while it rewrites files, instead of
+    /// blocking every read that needs the same handle.
+    db: Mutex<Option<Arc<DB>>>,
     read_only: bool,
     closed: AtomicBool,
     closed_rx: tokio::sync::watch::Sender<bool>,
@@ -53,7 +58,7 @@ impl Store {
     fn from_db(db: DB, read_only: bool) -> Result<Store> {
         Ok(Store {
             inner: Arc::new(Inner {
-                db: Mutex::new(Some(db)),
+                db: Mutex::new(Some(Arc::new(db))),
                 read_only,
                 closed: AtomicBool::new(false),
                 closed_rx: tokio::sync::watch::channel(false).0,
@@ -87,20 +92,53 @@ impl Store {
         self.with_db(|db, cf| db.flush_cf(cf).map_err(|e| Error::Rocks(e.to_string())))
     }
 
-    fn lock_db(&self) -> MutexGuard<'_, Option<DB>> {
+    /// Rewrites the SSTs and `.blob` files now, as JS `coreStorage.compact(options)` does, so
+    /// rows tombstoned by `delete_block_range` leave the disk instead of waiting for a
+    /// size-triggered compaction.
+    ///
+    /// `relocate_blobs` is JS `blobGarbageCollectionPolicy: 1` with
+    /// `blobGarbageCollectionAgeCutoff: 1.0` (a full cache wipe with no live blobs left): the age
+    /// cutoff is the only blob-GC knob RocksDB lets us change at runtime, so a partially live
+    /// blob file is rewritten here too. `false` is policy 2, the open-time default (`kIfNeeded`),
+    /// which only unlinks the 100%-dead files. Blocks, like RocksDB's own `CompactRange`.
+    pub fn compact(&self, relocate_blobs: bool) -> Result<()> {
+        if self.inner.read_only {
+            return Err(Error::ReadOnly);
+        }
+        let db = self.handle()?;
+        let cf = db
+            .cf_handle(COLUMN_FAMILY)
+            .ok_or_else(|| Error::Corrupt("missing corestore column family".into()))?;
+        if relocate_blobs {
+            let _ = db.set_options_cf(&cf, &[("blob_garbage_collection_age_cutoff", "1.0")]);
+        }
+        let mut options = CompactOptions::default();
+        options.set_exclusive_manual_compaction(true);
+        options.set_bottommost_level_compaction(BottommostLevelCompaction::Force);
+        db.compact_range_cf_opt(&cf, None::<&[u8]>, None::<&[u8]>, &options);
+        if relocate_blobs {
+            let _ = db.set_options_cf(&cf, &[("blob_garbage_collection_age_cutoff", "0.25")]);
+        }
+        Ok(())
+    }
+
+    fn lock_db(&self) -> MutexGuard<'_, Option<Arc<DB>>> {
         self.inner
             .db
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    fn handle(&self) -> Result<Arc<DB>> {
+        self.lock_db().as_ref().cloned().ok_or(Error::Closed)
+    }
+
     fn with_db<T>(&self, f: impl FnOnce(&DB, &ColumnFamily) -> Result<T>) -> Result<T> {
-        let guard = self.lock_db();
-        let db = guard.as_ref().ok_or(Error::Closed)?;
+        let db = self.handle()?;
         let cf = db
             .cf_handle(COLUMN_FAMILY)
             .ok_or_else(|| Error::Corrupt("missing corestore column family".into()))?;
-        f(db, cf)
+        f(&db, cf)
     }
 
     /// Reads one row.

@@ -265,3 +265,60 @@ fn a_key_pair_survives_and_rebuilds_the_public_half() {
     assert_eq!(pair.secret_key, Some(secret));
     assert_eq!(pair.public_key, [8; 32]);
 }
+
+/// `gcStorage`'s compaction: a cache wipe must give the bytes back now, not after the next
+/// size-triggered compaction. Blob rows live in `.blob` files that only a compaction unlinks.
+#[test]
+fn compaction_gives_back_the_bytes_a_clear_tombstoned() {
+    fn dir_bytes(dir: &std::path::Path) -> u64 {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    dir_bytes(&path)
+                } else {
+                    std::fs::metadata(&path).unwrap().len()
+                }
+            })
+            .sum()
+    }
+
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let (create, _) = core(1, [0; 32], "a");
+    let storage = store.create_core(create).unwrap();
+    let block = Bytes::from(vec![7u8; 512 * 1024]);
+    let blocks = 32u64;
+    let mut tx = storage.write();
+    for index in 0..blocks {
+        tx.put_block(index, block.clone());
+    }
+    tx.set_head(&CoreHead {
+        fork: 0,
+        length: blocks,
+        root_hash: [2; 32],
+        signature: None,
+        timestamp: 1,
+    });
+    storage.flush(tx).unwrap();
+    store.flush().unwrap();
+    let written = dir_bytes(dir.path());
+    assert!(
+        written >= 16 * 1024 * 1024,
+        "16 MiB of blocks must be on disk before the clear, got {written}"
+    );
+
+    let mut tx = storage.write();
+    tx.delete_block_range(0, blocks);
+    storage.flush(tx).unwrap();
+    store.flush().unwrap();
+    store.compact(false).unwrap();
+    let after = dir_bytes(dir.path());
+    assert!(
+        written.saturating_sub(after) >= 12 * 1024 * 1024,
+        "compaction reclaimed {} of {written} bytes",
+        written.saturating_sub(after)
+    );
+}
