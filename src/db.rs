@@ -14,8 +14,9 @@ use crate::{Error, Result};
 pub const COLUMN_FAMILY: &str = "corestore";
 
 static BLOCK_CACHE: LazyLock<Cache> = LazyLock::new(|| Cache::new_lru_cache(8 * 1024 * 1024));
+// A large atomic batch can leave an idle DB over budget; stalling another DB deadlocks it.
 static WRITE_BUFFERS: LazyLock<WriteBufferManager> =
-    LazyLock::new(|| WriteBufferManager::new_write_buffer_manager(32 * 1024 * 1024, true));
+    LazyLock::new(|| WriteBufferManager::new_write_buffer_manager(32 * 1024 * 1024, false));
 
 pub(crate) fn open(path: &Path, read_only: bool) -> Result<DB> {
     let mut options = Options::default();
@@ -86,5 +87,29 @@ mod tests {
                 assert_eq!(db.get_cf(cf, i.to_be_bytes()).unwrap().unwrap(), value);
             }
         }
+    }
+
+    #[test]
+    fn oversized_atomic_batch_does_not_stall_another_store() {
+        let writer_dir = tempfile::tempdir().unwrap();
+        let reader_dir = tempfile::tempdir().unwrap();
+        let writer = open(writer_dir.path(), false).unwrap();
+        let reader = open(reader_dir.path(), false).unwrap();
+        let cf = writer.cf_handle(COLUMN_FAMILY).unwrap();
+        let value = vec![0x5a; 512 * 1024];
+        let mut batch = rocksdb::WriteBatch::default();
+        for i in 0u64..96 {
+            batch.put_cf(cf, i.to_be_bytes(), &value);
+        }
+        writer.write(batch).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let write = std::thread::spawn(move || {
+            let cf = reader.cf_handle(COLUMN_FAMILY).unwrap();
+            tx.send(reader.put_cf(cf, b"metadata", b"value")).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("an idle writer must not stall another DB")
+            .unwrap();
+        write.join().unwrap();
     }
 }

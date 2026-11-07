@@ -45,10 +45,13 @@ Rows this crate does not interpret (named-session dependencies, marks, local
 entries, extra bitfield kinds, group rows) are never rewritten or dropped.
 
 Runtime memory budgets are shared across stores in a process: an 8 MiB block
-cache (including index/filter blocks) and a 32 MiB write-buffer manager, with
-two 8 MiB memtables per column family and at most 48 open files per DB. Each
-Corestore directory is one DB, not one DB per core or followed channel.
+cache (including index/filter blocks) and a 32 MiB write-buffer flush target, with
+two 8 MiB memtables per corestore column family and at most 48 open files per DB.
+Each Corestore directory is one DB, not one DB per core or followed channel.
 These limits also apply to read-only opens; table/row formats are unchanged.
+The write-buffer target is soft: an atomic batch may exceed it. Global writer
+stalling is disabled because an oversized batch in an idle DB can otherwise
+block writes to another DB forever, including its first core's metadata.
 
 ## Tests
 
