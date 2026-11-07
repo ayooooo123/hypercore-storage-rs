@@ -75,7 +75,7 @@ Six runs, no `sync` in between; the spread is other builds on the same
 machine. The first, cold run wrote at 283 MiB/s.
 
 For a paced 256 MiB ingest (512 KiB values, 20 ms between eight-block bursts),
-three local arm64 Mac runs reduced peak memtables from 76 MiB to 12–16 MiB
-and maximum RSS from 103–105 MiB to 38–56 MiB. The measured RocksDB default
+three local arm64 Mac runs reduced peak memtables from 76 MiB to 12 MiB
+and maximum RSS from 102–126 MiB to 43–53 MiB. The measured RocksDB default
 cache capacity was 32 MiB per DB; the shared cache is 8 MiB total. Smaller
 flushes produced more table readers (7.6 KiB → 37.9 KiB in that workload).
