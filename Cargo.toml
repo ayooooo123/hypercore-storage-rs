@@ -1,0 +1,31 @@
+[package]
+name = "hypercore-storage-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+description = "Rust port of npm hypercore-storage 3.4.0: the same RocksDB layout, read and write"
+keywords = ["hypercore", "corestore", "rocksdb", "storage"]
+categories = ["database", "p2p"]
+
+[lib]
+name = "hypercore_storage"
+
+[dependencies]
+bytes = "1"
+compact-encoding-rs = { path = "../compact-encoding-rs" }
+# JS writes kNoCompression; snappy stays available so older JS stores are
+# readable. Everything else would only lengthen the from-source build.
+tokio = { version = "1.40", features = ["sync"] }
+rocksdb = { version = "0.24", default-features = false, features = [
+    "snappy",
+    "bindgen-runtime",
+] }
+
+[build-dependencies]
+hyperschema-rs = { path = "../hyperschema-rs" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[workspace]
