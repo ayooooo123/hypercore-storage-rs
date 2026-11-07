@@ -17,7 +17,7 @@ use rocksdb::{
 use crate::db::{self, COLUMN_FAMILY};
 use crate::keys;
 use crate::rows::{
-    Alias, Auth, Core, CoreGroup, CoreHead, Dependency, GroupKey, Hints, Info, Session, StoreHead,
+    Alias, Auth, Core, CoreGroup, CoreHead, Dependency, GroupRow, Hints, Info, Session, StoreHead,
 };
 use crate::{Error, Result};
 
@@ -572,16 +572,20 @@ impl Store {
     }
 
     /// Group updates at or after `since`, descending (JS's stream default).
-    pub fn group_updates(&self, group: u64, since: u64) -> Result<Vec<(u64, GroupKey)>> {
+    pub fn group_updates(&self, group: u64, since: u64) -> Result<Vec<GroupRow>> {
         let start = keys::group_entry(group, since, 0);
         let end = keys::group_entry_end(group);
         let mut out = Vec::new();
         for (row, value) in self.range_reverse(&start, &end)? {
-            let Some((timestamp, _)) = keys::read_group_entry(&row) else {
+            let Some((timestamp, core_pointer)) = keys::read_group_entry(&row) else {
                 continue;
             };
             if let Ok(key) = <[u8; 32]>::try_from(value.as_ref()) {
-                out.push((timestamp, key));
+                out.push(GroupRow {
+                    timestamp,
+                    core_pointer,
+                    key,
+                });
             }
         }
         Ok(out)
@@ -981,18 +985,28 @@ impl CoreTx {
         );
     }
 
-    pub fn set_group(&mut self, group: Option<[u8; 32]>) {
+    pub fn set_group(&mut self, group: Option<CoreGroup>) {
         match group {
-            Some(key) => self.put(
-                keys::core_group(self.core_pointer),
-                CoreGroup { key: Some(key) }.encode(),
-            ),
+            Some(group) => self.put(keys::core_group(self.core_pointer), group.encode()),
             None => self.delete(keys::core_group(self.core_pointer)),
         }
     }
 
     pub fn set_head(&mut self, head: &CoreHead) {
         self.put(keys::data_head(self.data_pointer), head.encode());
+    }
+
+    /// `putGroupUpdate(groupPtr, timestamp, key)`: this core's entry in the
+    /// group's update log, keyed by the head timestamp it stands for.
+    pub fn put_group_update(&mut self, group: u64, timestamp: u64, key: &[u8; 32]) {
+        self.put(
+            keys::group_entry(group, timestamp, self.core_pointer),
+            Bytes::copy_from_slice(key),
+        );
+    }
+
+    pub fn delete_group_update(&mut self, group: u64, timestamp: u64) {
+        self.delete(keys::group_entry(group, timestamp, self.core_pointer));
     }
 
     pub fn delete_head(&mut self) {

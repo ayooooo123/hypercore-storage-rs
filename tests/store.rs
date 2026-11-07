@@ -144,9 +144,20 @@ fn counters_and_groups_follow_the_head() {
     store.put_group_update(group, 200, 1, &[2; 32]).unwrap();
     let updates = store.group_updates(group, 100).unwrap();
     assert_eq!(
-        updates,
+        updates
+            .iter()
+            .map(|row| (row.timestamp, row.key))
+            .collect::<Vec<_>>(),
         vec![(200, [2u8; 32]), (100, [1u8; 32])],
         "newest first, at or after since"
+    );
+    assert_eq!(
+        updates
+            .iter()
+            .map(|row| row.core_pointer)
+            .collect::<Vec<_>>(),
+        vec![1, 0],
+        "each row keeps the core pointer it was written with"
     );
     assert_eq!(store.group_updates(group, 150).unwrap().len(), 1);
 }

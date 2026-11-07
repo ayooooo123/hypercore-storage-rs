@@ -305,25 +305,39 @@ impl Session {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CoreGroup {
     pub key: Option<[u8; 32]>,
+    /// The group's pointer in the store head's `groups` counter. JS encodes it
+    /// only when non-zero (`if (m.pointer)` in the schema), so 0 reads as absent.
+    pub pointer: u64,
 }
 
 impl CoreGroup {
     pub fn encode(&self) -> Bytes {
         compact_encoding::encode(&core_schema::Group {
             key: self.key,
-            pointer: None,
+            pointer: (self.pointer != 0).then_some(self.pointer),
         })
     }
 
     pub fn decode(bytes: Bytes) -> Result<Self> {
+        let group = core_schema::Group::decode(&mut Reader::new(bytes))?;
         Ok(Self {
-            key: core_schema::Group::decode(&mut Reader::new(bytes))?.key,
+            key: group.key,
+            pointer: group.pointer.unwrap_or(0),
         })
     }
 }
 
 /// A group update (`TL_GROUP` row value: the core key).
 pub type GroupKey = [u8; 32];
+
+/// One row of a group's update log: the key's group, timestamp and core
+/// pointer, and the member core's key it points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupRow {
+    pub timestamp: u64,
+    pub core_pointer: u64,
+    pub key: GroupKey,
+}
 
 /// Everything `getInfos` returns for one discovery key.
 #[derive(Debug, Clone)]
