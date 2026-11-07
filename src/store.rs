@@ -42,6 +42,7 @@ struct Inner {
     closed_rx: tokio::sync::watch::Sender<bool>,
     /// One writer at a time: creating a core reads and bumps the store head.
     write: Mutex<()>,
+    tree_cache: Mutex<crate::tree_cache::TreeCache>,
 }
 
 impl Store {
@@ -63,6 +64,7 @@ impl Store {
                 closed: AtomicBool::new(false),
                 closed_rx: tokio::sync::watch::channel(false).0,
                 write: Mutex::new(()),
+                tree_cache: Mutex::new(Default::default()),
             }),
         })
     }
@@ -133,6 +135,13 @@ impl Store {
         self.lock_db().as_ref().cloned().ok_or(Error::Closed)
     }
 
+    fn tree_cache(&self) -> MutexGuard<'_, crate::tree_cache::TreeCache> {
+        self.inner
+            .tree_cache
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     fn with_db<T>(&self, f: impl FnOnce(&DB, &ColumnFamily) -> Result<T>) -> Result<T> {
         let db = self.handle()?;
         let cf = db
@@ -189,16 +198,31 @@ impl Store {
             return Err(Error::ReadOnly);
         }
         self.with_db(|db, cf| {
+            // Serialize cache fills with commits so a stale read cannot outlive an overwrite.
+            let mut cache = self.tree_cache();
             let mut batch = WriteBatch::default();
-            for op in ops {
+            for op in &ops {
                 match op {
                     Op::Put(key, value) => batch.put_cf(cf, key, value),
+                    Op::PutTree(pointer, node) => batch.put_cf(
+                        cf,
+                        keys::data_tree(*pointer, node.index),
+                        crate::rows::encode_tree_node(node),
+                    ),
                     Op::Delete(key) => batch.delete_cf(cf, key),
                     Op::DeleteRange(start, end) => batch.delete_range_cf(cf, start, end),
                 }
             }
             // JS writes with default options: atomic, WAL on, no per-batch fsync.
-            db.write(batch).map_err(|e| Error::Rocks(e.to_string()))
+            db.write(batch).map_err(|e| Error::Rocks(e.to_string()))?;
+            for op in ops {
+                match op {
+                    Op::PutTree(pointer, node) => cache.put(pointer, node),
+                    Op::Put(_, _) => {}
+                    Op::Delete(_) | Op::DeleteRange(_, _) => cache.clear(),
+                }
+            }
+            Ok(())
         })
     }
 
@@ -747,17 +771,95 @@ impl CoreStorage {
 
     /// Tree node `index`, looking in the oldest dependency that covers it first.
     pub fn get_tree_node(&self, index: u64) -> Result<Option<Node>> {
-        let pointer = self
-            .dependencies
+        self.store.with_db(|db, cf| {
+            let mut cache = self.store.tree_cache();
+            let pointer = self.tree_pointer(index);
+            if let Some(node) = cache.get((pointer, index)) {
+                return Ok(Some(node));
+            }
+            let node = db
+                .get_cf(cf, keys::data_tree(pointer, index))
+                .map_err(|e| Error::Rocks(e.to_string()))?
+                .map(|bytes| crate::rows::decode_tree_node(Bytes::from(bytes)))
+                .transpose()?;
+            if let Some(node) = node {
+                cache.put(pointer, node);
+            }
+            Ok(node)
+        })
+    }
+
+    fn tree_pointer(&self, index: u64) -> u64 {
+        self.dependencies
             .iter()
             .find(|dependency| {
-                crate::flat::right_span(index) <= (dependency.length.saturating_sub(1)) * 2
+                crate::flat::right_span(index) <= dependency.length.saturating_sub(1) * 2
             })
-            .map_or(self.data_pointer, |dependency| dependency.data_pointer);
-        match self.store.get(&keys::data_tree(pointer, index))? {
-            Some(bytes) => Ok(Some(crate::rows::decode_tree_node(bytes)?)),
-            None => Ok(None),
-        }
+            .map_or(self.data_pointer, |dependency| dependency.data_pointer)
+    }
+
+    /// Ordered, dependency-aware tree reads in one RocksDB multi-get; cached nodes need no I/O.
+    pub fn get_tree_nodes(&self, indices: &[u64]) -> Result<Vec<Option<Node>>> {
+        self.store.with_db(|db, cf| {
+            let mut cache = self.store.tree_cache();
+            let mut out = Vec::with_capacity(indices.len());
+            let mut missing = Vec::new();
+            let mut row_keys = Vec::new();
+            for (slot, &index) in indices.iter().enumerate() {
+                let pointer = self.tree_pointer(index);
+                let node = cache.get((pointer, index));
+                out.push(node);
+                if node.is_none() {
+                    missing.push((slot, pointer));
+                    row_keys.push(keys::data_tree(pointer, index));
+                }
+            }
+            if !missing.is_empty() {
+                let values = if row_keys.len() == 1 {
+                    vec![db.get_cf(cf, &row_keys[0])]
+                } else {
+                    db.multi_get_cf(row_keys.iter().map(|key| (cf, key)))
+                };
+                for ((slot, pointer), value) in missing.into_iter().zip(values) {
+                    if let Some(bytes) = value.map_err(|e| Error::Rocks(e.to_string()))? {
+                        let node = crate::rows::decode_tree_node(Bytes::from(bytes))?;
+                        cache.put(pointer, node);
+                        out[slot] = Some(node);
+                    }
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Missing prefix of an ancestor path, stopping at the first cached or persisted node.
+    pub fn missing_tree_nodes(&self, indices: impl IntoIterator<Item = u64>) -> Result<u64> {
+        self.store.with_db(|db, cf| {
+            let mut cache = self.store.tree_cache();
+            let mut row_keys = Vec::new();
+            for index in indices {
+                if cache.get((self.tree_pointer(index), index)).is_some() {
+                    break;
+                }
+                row_keys.push(keys::data_tree(self.tree_pointer(index), index));
+            }
+            if row_keys.is_empty() {
+                return Ok(0);
+            }
+            let values = if row_keys.len() == 1 {
+                vec![db.get_cf(cf, &row_keys[0])]
+            } else {
+                db.multi_get_cf(row_keys.iter().map(|key| (cf, key)))
+            };
+            for (slot, value) in values.into_iter().enumerate() {
+                if let Some(bytes) = value.map_err(|e| Error::Rocks(e.to_string()))? {
+                    let node = crate::rows::decode_tree_node(Bytes::from(bytes))?;
+                    cache.put(self.tree_pointer(node.index), node);
+                    return Ok(slot as u64);
+                }
+            }
+            Ok(row_keys.len() as u64)
+        })
     }
 
     pub fn get_user_data(&self, key: &str) -> Result<Option<Bytes>> {
@@ -946,6 +1048,7 @@ impl Store {
 
 enum Op {
     Put(Vec<u8>, Bytes),
+    PutTree(u64, Node),
     Delete(Vec<u8>),
     DeleteRange(Vec<u8>, Vec<u8>),
 }
@@ -1055,10 +1158,7 @@ impl CoreTx {
     }
 
     pub fn put_tree_node(&mut self, node: Node) {
-        self.put(
-            keys::data_tree(self.data_pointer, node.index),
-            crate::rows::encode_tree_node(&node),
-        );
+        self.ops.push(Op::PutTree(self.data_pointer, node));
     }
 
     pub fn delete_tree_node(&mut self, index: u64) {

@@ -333,3 +333,89 @@ fn compaction_gives_back_the_bytes_a_clear_tombstoned() {
         written.saturating_sub(after)
     );
 }
+
+#[test]
+fn cached_multi_get_tracks_commits_dependencies_and_close() {
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let (create, _) = core(1, [0; 32], "tree");
+    let parent = store.create_core(create).unwrap();
+    let original = Node {
+        index: 0,
+        size: 1,
+        hash: [1; 32],
+    };
+    let root = Node {
+        index: 1,
+        size: 2,
+        hash: [2; 32],
+    };
+    let mut tx = parent.write();
+    tx.put_tree_node(original);
+    tx.put_tree_node(root);
+    tx.set_head(&CoreHead {
+        length: 2,
+        ..Default::default()
+    });
+    parent.flush(tx).unwrap();
+    let session = parent.create_session("copy", None).unwrap();
+    let own = Node {
+        index: 4,
+        size: 3,
+        hash: [3; 32],
+    };
+    let mut tx = session.write();
+    tx.put_tree_node(own);
+    session.flush(tx).unwrap();
+    assert_eq!(
+        session.get_tree_nodes(&[4, 0, 9, 1, 0]).unwrap(),
+        vec![Some(own), Some(original), None, Some(root), Some(original)]
+    );
+    assert_eq!(parent.get_tree_node(4).unwrap(), None);
+    assert_eq!(session.missing_tree_nodes([9, 4, 0]).unwrap(), 1);
+    assert_eq!(session.missing_tree_nodes([0, 1, 9]).unwrap(), 0);
+    assert_eq!(session.missing_tree_nodes([9, 11]).unwrap(), 2);
+    let replacement = Node {
+        hash: [4; 32],
+        ..original
+    };
+    let mut tx = parent.write();
+    tx.put_tree_node(replacement);
+    parent.flush(tx).unwrap();
+    assert_eq!(session.get_tree_node(0).unwrap(), Some(replacement));
+    let mut tx = parent.write();
+    tx.delete_tree_node(0);
+    parent.flush(tx).unwrap();
+    assert_eq!(
+        session.get_tree_nodes(&[0, 1, 4]).unwrap(),
+        vec![None, Some(root), Some(own)]
+    );
+    let mut tx = parent.write();
+    tx.delete_tree_range(0, 3);
+    parent.flush(tx).unwrap();
+    assert_eq!(session.get_tree_node(1).unwrap(), None);
+    assert_eq!(session.get_tree_node(4).unwrap(), Some(own));
+    store.close();
+    let reopened = Store::open(dir.path()).unwrap();
+    let session = reopened
+        .resume_core(&discovery_key(1))
+        .unwrap()
+        .unwrap()
+        .resume_session("copy")
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.missing_tree_nodes([9, 4]).unwrap(), 1);
+    assert_eq!(
+        session.get_tree_nodes(&[4, 0, 4]).unwrap(),
+        vec![Some(own), None, Some(own)]
+    );
+    reopened.close();
+    assert!(matches!(
+        session.get_tree_node(4),
+        Err(hypercore_storage::Error::Closed)
+    ));
+    assert!(matches!(
+        session.get_tree_nodes(&[4]),
+        Err(hypercore_storage::Error::Closed)
+    ));
+}

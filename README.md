@@ -53,6 +53,16 @@ The write-buffer target is soft: an atomic batch may exceed it. Global writer
 stalling is disabled because an oversized batch in an idle DB can otherwise
 block writes to another DB forever, including its first core's metadata.
 
+Tree reads also share a per-store 32768-node LRU (about 4 MiB). It caches only
+present nodes, keyed by resolved data pointer and node index, and follows atomic
+overwrites and deletions, including named-session dependencies. `get_tree_nodes`
+preserves input order and uses one RocksDB multi-get for multiple cache misses
+(a single miss uses one get without multi-get setup).
+`missing_tree_nodes` consumes an ancestor iterator only up to a cached node,
+then batches the unresolved prefix; a cache hit allocates nothing. Committed
+tree writes populate the cache from their decoded nodes without decoding them again.
+This changes no row, table, or wire encoding.
+
 ## Tests
 
 `cargo test` runs row-level round trips against the raw layout, including a
