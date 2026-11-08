@@ -5,7 +5,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 
 use bytes::Bytes;
 use compact_encoding::hypercore::Node;
@@ -27,6 +27,12 @@ pub const STORE_VERSION: u64 = 2;
 /// The deepest dependency chain `resume_core` follows before giving up.
 const MAX_DEPENDENCIES: usize = 64;
 
+const TREE_LOCKS: usize = 32;
+
+fn tree_lock(pointer: u64) -> usize {
+    (pointer % TREE_LOCKS as u64) as usize
+}
+
 /// A directory of cores in one RocksDB, in hypercore-storage's layout.
 #[derive(Clone)]
 pub struct Store {
@@ -44,6 +50,7 @@ struct Inner {
     write: Mutex<()>,
     compact: Mutex<()>,
     tree_cache: Mutex<crate::tree_cache::TreeCache>,
+    tree_io: [RwLock<()>; TREE_LOCKS],
 }
 
 impl Store {
@@ -67,6 +74,7 @@ impl Store {
                 write: Mutex::new(()),
                 compact: Mutex::new(()),
                 tree_cache: Mutex::new(Default::default()),
+                tree_io: std::array::from_fn(|_| RwLock::new(())),
             }),
         })
     }
@@ -219,8 +227,6 @@ impl Store {
             return Err(Error::ReadOnly);
         }
         self.with_db(|db, cf| {
-            // Serialize cache fills with commits so a stale read cannot outlive an overwrite.
-            let mut cache = self.tree_cache();
             let mut batch = WriteBatch::default();
             for op in &ops {
                 match op {
@@ -234,8 +240,19 @@ impl Store {
                     Op::DeleteRange(start, end) => batch.delete_range_cf(cf, start, end),
                 }
             }
+            // Different data pointers may commit concurrently; cache fills must follow their writes.
+            let mask = ops.iter().fold(0u32, |mask, op| match op {
+                Op::PutTree(pointer, _) => mask | (1 << tree_lock(*pointer)),
+                Op::Delete(_) | Op::DeleteRange(_, _) => u32::MAX,
+                Op::Put(_, _) => mask,
+            });
+            let _writes: [_; TREE_LOCKS] = std::array::from_fn(|i| {
+                (mask & (1 << i) != 0)
+                    .then(|| self.inner.tree_io[i].write().unwrap_or_else(|e| e.into_inner()))
+            });
             // JS writes with default options: atomic, WAL on, no per-batch fsync.
             db.write(batch).map_err(|e| Error::Rocks(e.to_string()))?;
+            let mut cache = self.tree_cache();
             for op in ops {
                 match op {
                     Op::PutTree(pointer, node) => cache.put(pointer, node),
@@ -793,9 +810,11 @@ impl CoreStorage {
     /// Tree node `index`, looking in the oldest dependency that covers it first.
     pub fn get_tree_node(&self, index: u64) -> Result<Option<Node>> {
         self.store.with_db(|db, cf| {
-            let mut cache = self.store.tree_cache();
             let pointer = self.tree_pointer(index);
-            if let Some(node) = cache.get((pointer, index)) {
+            let _read = self.store.inner.tree_io[tree_lock(pointer)]
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(node) = self.store.tree_cache().get((pointer, index)) {
                 return Ok(Some(node));
             }
             let node = db
@@ -804,7 +823,7 @@ impl CoreStorage {
                 .map(|bytes| crate::rows::decode_tree_node(Bytes::from(bytes)))
                 .transpose()?;
             if let Some(node) = node {
-                cache.put(pointer, node);
+                self.store.tree_cache().put(pointer, node);
             }
             Ok(node)
         })
@@ -819,9 +838,21 @@ impl CoreStorage {
             .map_or(self.data_pointer, |dependency| dependency.data_pointer)
     }
 
+    fn tree_reads(&self) -> [Option<RwLockReadGuard<'_, ()>>; TREE_LOCKS] {
+        let mut mask = 1u32 << tree_lock(self.data_pointer);
+        for dependency in &self.dependencies {
+            mask |= 1 << tree_lock(dependency.data_pointer);
+        }
+        std::array::from_fn(|i| {
+            (mask & (1 << i) != 0)
+                .then(|| self.store.inner.tree_io[i].read().unwrap_or_else(|e| e.into_inner()))
+        })
+    }
+
     /// Ordered, dependency-aware tree reads in one RocksDB multi-get; cached nodes need no I/O.
     pub fn get_tree_nodes(&self, indices: &[u64]) -> Result<Vec<Option<Node>>> {
         self.store.with_db(|db, cf| {
+            let _reads = self.tree_reads();
             let mut cache = self.store.tree_cache();
             let mut out = Vec::with_capacity(indices.len());
             let mut missing = Vec::new();
@@ -835,12 +866,14 @@ impl CoreStorage {
                     row_keys.push(keys::data_tree(pointer, index));
                 }
             }
+            drop(cache);
             if !missing.is_empty() {
                 let values = if row_keys.len() == 1 {
                     vec![db.get_cf(cf, &row_keys[0])]
                 } else {
                     db.multi_get_cf(row_keys.iter().map(|key| (cf, key)))
                 };
+                let mut cache = self.store.tree_cache();
                 for ((slot, pointer), value) in missing.into_iter().zip(values) {
                     if let Some(bytes) = value.map_err(|e| Error::Rocks(e.to_string()))? {
                         let node = crate::rows::decode_tree_node(Bytes::from(bytes))?;
@@ -856,6 +889,7 @@ impl CoreStorage {
     /// Missing prefix of an ancestor path, stopping at the first cached or persisted node.
     pub fn missing_tree_nodes(&self, indices: impl IntoIterator<Item = u64>) -> Result<u64> {
         self.store.with_db(|db, cf| {
+            let _reads = self.tree_reads();
             let mut cache = self.store.tree_cache();
             let mut row_keys = Vec::new();
             for index in indices {
@@ -864,6 +898,7 @@ impl CoreStorage {
                 }
                 row_keys.push(keys::data_tree(self.tree_pointer(index), index));
             }
+            drop(cache);
             if row_keys.is_empty() {
                 return Ok(0);
             }
@@ -875,7 +910,7 @@ impl CoreStorage {
             for (slot, value) in values.into_iter().enumerate() {
                 if let Some(bytes) = value.map_err(|e| Error::Rocks(e.to_string()))? {
                     let node = crate::rows::decode_tree_node(Bytes::from(bytes))?;
-                    cache.put(self.tree_pointer(node.index), node);
+                    self.store.tree_cache().put(self.tree_pointer(node.index), node);
                     return Ok(slot as u64);
                 }
             }
@@ -1238,6 +1273,26 @@ impl CoreTx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_io_for_one_data_pointer_does_not_lock_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let cores: Vec<_> = (1..=2).map(|key| {
+            store.create_core(CreateCore {
+                key: [key; 32], discovery_key: [key; 32], ..Default::default()
+            }).unwrap()
+        }).collect();
+        let node = Node { index: 0, size: 1, hash: [1; 32] };
+        let first = tree_lock(cores[0].data_pointer());
+        let _writing = store.inner.tree_io[first].write().unwrap();
+        let mut tx = cores[1].write();
+        tx.put_tree_node(node);
+        cores[1].flush(tx).unwrap();
+        assert_eq!(cores[1].get_tree_node(0).unwrap(), Some(node));
+        assert_eq!(cores[1].get_tree_nodes(&[0, 1]).unwrap(), vec![Some(node), None]);
+        assert_eq!(cores[1].missing_tree_nodes([1, 0]).unwrap(), 1);
+    }
 
     #[test]
     fn streaming_compaction_does_not_relocate_live_blobs() {

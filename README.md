@@ -61,6 +61,12 @@ preserves input order and uses one RocksDB multi-get for multiple cache misses
 `missing_tree_nodes` consumes an ancestor iterator only up to a cached node,
 then batches the unresolved prefix; a cache hit allocates nothing. Committed
 tree writes populate the cache from their decoded nodes without decoding them again.
+The cache grows on demand rather than reserving its full capacity at store open.
+Tree I/O is synchronized by data pointer (32 fixed lock stripes), while the one
+shared LRU mutex protects only cache operations, never RocksDB reads or writes.
+Multi-get and named-session reads lock their dependency pointers in stripe order;
+deletions lock all stripes before committing and invalidating the cache.
+
 This changes no row, table, or wire encoding.
 
 Manual `Store::compact(false)` matches streaming/ceiling reclamation: it is

@@ -24,8 +24,8 @@ pub(crate) struct TreeCache {
 impl Default for TreeCache {
     fn default() -> Self {
         Self {
-            indices: HashMap::with_capacity(CAPACITY),
-            entries: Vec::with_capacity(CAPACITY),
+            indices: HashMap::new(),
+            entries: Vec::new(),
             newest: NONE,
             oldest: NONE,
         }
@@ -118,6 +118,8 @@ mod tests {
     #[test]
     fn bounds_and_evicts_least_recently_used() {
         let mut cache = TreeCache::default();
+        assert_eq!(cache.indices.capacity(), 0);
+        assert_eq!(cache.entries.capacity(), 0);
         for i in 0..CAPACITY as u64 {
             cache.put(1, node(i));
         }
