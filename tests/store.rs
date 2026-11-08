@@ -335,6 +335,43 @@ fn compaction_gives_back_the_bytes_a_clear_tombstoned() {
 }
 
 #[test]
+fn streaming_compaction_keeps_unchanged_bottommost_tables() {
+    fn tables(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                paths.extend(tables(&path));
+            } else if path.extension().is_some_and(|ext| ext == "sst") {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        paths
+    }
+
+    let dir = tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let (create, _) = core(1, [0; 32], "playing");
+    let storage = store.create_core(create).unwrap();
+    let mut tx = storage.write();
+    for index in 0..32 {
+        tx.put_block(index, Bytes::from(vec![index as u8; 512 * 1024]));
+    }
+    storage.flush(tx).unwrap();
+    store.flush().unwrap();
+    store.compact(true).unwrap();
+    let before = tables(dir.path());
+    assert!(!before.is_empty());
+    store.compact(false).unwrap();
+    assert_eq!(
+        tables(dir.path()),
+        before,
+        "streaming GC must not force a bottommost rewrite"
+    );
+}
+
+#[test]
 fn cached_multi_get_tracks_commits_dependencies_and_close() {
     let dir = tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();

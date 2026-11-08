@@ -42,6 +42,7 @@ struct Inner {
     closed_rx: tokio::sync::watch::Sender<bool>,
     /// One writer at a time: creating a core reads and bumps the store head.
     write: Mutex<()>,
+    compact: Mutex<()>,
     tree_cache: Mutex<crate::tree_cache::TreeCache>,
 }
 
@@ -64,6 +65,7 @@ impl Store {
                 closed: AtomicBool::new(false),
                 closed_rx: tokio::sync::watch::channel(false).0,
                 write: Mutex::new(()),
+                compact: Mutex::new(()),
                 tree_cache: Mutex::new(Default::default()),
             }),
         })
@@ -98,29 +100,48 @@ impl Store {
     /// rows tombstoned by `delete_block_range` leave the disk instead of waiting for a
     /// size-triggered compaction.
     ///
-    /// `relocate_blobs` is JS `blobGarbageCollectionPolicy: 1` with
-    /// `blobGarbageCollectionAgeCutoff: 1.0` (a full cache wipe with no live blobs left): the age
-    /// cutoff is the only blob-GC knob RocksDB lets us change at runtime, so a partially live
-    /// blob file is rewritten here too. `false` is policy 2, the open-time default (`kIfNeeded`),
-    /// which only unlinks the 100%-dead files. Blocks, like RocksDB's own `CompactRange`.
+    /// `relocate_blobs` matches JS's exclusive full-wipe compaction with forced blob GC.
+    /// Streaming/ceiling compaction is non-exclusive and never relocates live blobs.
     pub fn compact(&self, relocate_blobs: bool) -> Result<()> {
         if self.inner.read_only {
             return Err(Error::ReadOnly);
         }
+        let _compact = self.inner.compact.lock().unwrap_or_else(|e| e.into_inner());
         let db = self.handle()?;
         let cf = db
             .cf_handle(COLUMN_FAMILY)
             .ok_or_else(|| Error::Corrupt("missing corestore column family".into()))?;
-        if relocate_blobs {
-            let _ = db.set_options_cf(&cf, &[("blob_garbage_collection_age_cutoff", "1.0")]);
-        }
+        // shortcut: CF-wide GC override until the Rust binding exposes per-compaction GC options.
+        db.set_options_cf(
+            &cf,
+            &[
+                (
+                    "enable_blob_garbage_collection",
+                    if relocate_blobs { "true" } else { "false" },
+                ),
+                (
+                    "blob_garbage_collection_age_cutoff",
+                    if relocate_blobs { "1.0" } else { "0.25" },
+                ),
+            ],
+        )
+        .map_err(|e| Error::Rocks(e.to_string()))?;
         let mut options = CompactOptions::default();
-        options.set_exclusive_manual_compaction(true);
-        options.set_bottommost_level_compaction(BottommostLevelCompaction::Force);
+        options.set_exclusive_manual_compaction(relocate_blobs);
+        options.set_bottommost_level_compaction(if relocate_blobs {
+            BottommostLevelCompaction::Force
+        } else {
+            BottommostLevelCompaction::Skip
+        });
         db.compact_range_cf_opt(&cf, None::<&[u8]>, None::<&[u8]>, &options);
-        if relocate_blobs {
-            let _ = db.set_options_cf(&cf, &[("blob_garbage_collection_age_cutoff", "0.25")]);
-        }
+        db.set_options_cf(
+            &cf,
+            &[
+                ("enable_blob_garbage_collection", "true"),
+                ("blob_garbage_collection_age_cutoff", "0.25"),
+            ],
+        )
+        .map_err(|e| Error::Rocks(e.to_string()))?;
         Ok(())
     }
 
@@ -1211,5 +1232,68 @@ impl CoreTx {
                 None => keys::data_local_end(self.data_pointer),
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_compaction_does_not_relocate_live_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store
+            .with_db(|db, cf| {
+                db.set_options_cf(
+                    cf,
+                    &[
+                        ("blob_file_size", "1048576"),
+                        ("disable_auto_compactions", "true"),
+                    ],
+                )
+                .map_err(|e| Error::Rocks(e.to_string()))
+            })
+            .unwrap();
+        let storage = store
+            .create_core(CreateCore {
+                key: [1; 32],
+                discovery_key: [2; 32],
+                ..Default::default()
+            })
+            .unwrap();
+        for index in 0..16 {
+            let mut tx = storage.write();
+            tx.put_block(index, Bytes::from(vec![index as u8; 1024 * 1024]));
+            storage.flush(tx).unwrap();
+            store.flush().unwrap();
+        }
+        store.compact(true).unwrap();
+        let blobs = || {
+            let mut files: Vec<_> = std::fs::read_dir(dir.path().join("db"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "blob"))
+                .collect();
+            files.sort();
+            files
+        };
+        let before = blobs();
+        assert!(
+            before.len() >= 4,
+            "exercise the oldest quarter of multiple blob files"
+        );
+        store.compact(false).unwrap();
+        assert_eq!(
+            blobs(),
+            before,
+            "streaming GC must never relocate live blob files"
+        );
+        for index in 0..16 {
+            assert_eq!(
+                storage.get_block(index).unwrap().unwrap(),
+                Bytes::from(vec![index as u8; 1024 * 1024])
+            );
+        }
     }
 }

@@ -63,6 +63,13 @@ then batches the unresolved prefix; a cache hit allocates nothing. Committed
 tree writes populate the cache from their decoded nodes without decoding them again.
 This changes no row, table, or wire encoding.
 
+Manual `Store::compact(false)` matches streaming/ceiling reclamation: it is
+non-exclusive, skips bottommost rewrites and disables live-blob relocation.
+Only `compact(true)` forces relocation for a full viewer cache wipe. Manual
+passes are serialized because the Rust binding requires a temporary CF-wide GC
+override; background GC is restored afterward. These blocking calls belong on
+the host's blocking executor, not its HTTP/replication event loop.
+
 ## Tests
 
 `cargo test` runs row-level round trips against the raw layout, including a
