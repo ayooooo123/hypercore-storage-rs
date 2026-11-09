@@ -247,8 +247,11 @@ impl Store {
                 Op::Put(_, _) => mask,
             });
             let _writes: [_; TREE_LOCKS] = std::array::from_fn(|i| {
-                (mask & (1 << i) != 0)
-                    .then(|| self.inner.tree_io[i].write().unwrap_or_else(|e| e.into_inner()))
+                (mask & (1 << i) != 0).then(|| {
+                    self.inner.tree_io[i]
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                })
             });
             // JS writes with default options: atomic, WAL on, no per-batch fsync.
             db.write(batch).map_err(|e| Error::Rocks(e.to_string()))?;
@@ -844,8 +847,11 @@ impl CoreStorage {
             mask |= 1 << tree_lock(dependency.data_pointer);
         }
         std::array::from_fn(|i| {
-            (mask & (1 << i) != 0)
-                .then(|| self.store.inner.tree_io[i].read().unwrap_or_else(|e| e.into_inner()))
+            (mask & (1 << i) != 0).then(|| {
+                self.store.inner.tree_io[i]
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+            })
         })
     }
 
@@ -910,7 +916,9 @@ impl CoreStorage {
             for (slot, value) in values.into_iter().enumerate() {
                 if let Some(bytes) = value.map_err(|e| Error::Rocks(e.to_string()))? {
                     let node = crate::rows::decode_tree_node(Bytes::from(bytes))?;
-                    self.store.tree_cache().put(self.tree_pointer(node.index), node);
+                    self.store
+                        .tree_cache()
+                        .put(self.tree_pointer(node.index), node);
                     return Ok(slot as u64);
                 }
             }
@@ -1278,19 +1286,32 @@ mod tests {
     fn tree_io_for_one_data_pointer_does_not_lock_another() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let cores: Vec<_> = (1..=2).map(|key| {
-            store.create_core(CreateCore {
-                key: [key; 32], discovery_key: [key; 32], ..Default::default()
-            }).unwrap()
-        }).collect();
-        let node = Node { index: 0, size: 1, hash: [1; 32] };
+        let cores: Vec<_> = (1..=2)
+            .map(|key| {
+                store
+                    .create_core(CreateCore {
+                        key: [key; 32],
+                        discovery_key: [key; 32],
+                        ..Default::default()
+                    })
+                    .unwrap()
+            })
+            .collect();
+        let node = Node {
+            index: 0,
+            size: 1,
+            hash: [1; 32],
+        };
         let first = tree_lock(cores[0].data_pointer());
         let _writing = store.inner.tree_io[first].write().unwrap();
         let mut tx = cores[1].write();
         tx.put_tree_node(node);
         cores[1].flush(tx).unwrap();
         assert_eq!(cores[1].get_tree_node(0).unwrap(), Some(node));
-        assert_eq!(cores[1].get_tree_nodes(&[0, 1]).unwrap(), vec![Some(node), None]);
+        assert_eq!(
+            cores[1].get_tree_nodes(&[0, 1]).unwrap(),
+            vec![Some(node), None]
+        );
         assert_eq!(cores[1].missing_tree_nodes([1, 0]).unwrap(), 1);
     }
 
