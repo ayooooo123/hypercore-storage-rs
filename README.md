@@ -44,11 +44,17 @@ assert_eq!(&block[..], b"hello");
 Rows this crate does not interpret (named-session dependencies, marks, local
 entries, extra bitfield kinds, group rows) are never rewritten or dropped.
 
-`Store::open_with_options(path, StoreOptions { wal: false })` is for a re-fetchable
+`Store::open_with_options(path, StoreOptions { wal: false, ..Default::default() })` is for a re-fetchable
 cache only. It skips WAL writes; a crash can discard unflushed whole batches
 (normal shutdown still flushes). Blocks, tree nodes and bitfield rows still
 commit atomically in one column family. `Store::open` keeps the WAL enabled for
 owned data, as before. No on-disk format changes.
+
+`StoreOptions { memory: true, ..Default::default() }` uses a fresh RocksDB MemEnv,
+including blob files, WAL-free. Reopening starts empty; flush, eviction and blob
+GC retain their normal paths and release MemEnv file storage. rust-rocksdb creates
+an empty directory on disk, but no database or media files. The caller must bound
+live data and allow headroom for memtables and transient GC copies.
 
 Runtime memory budgets are shared across stores in a process: an 8 MiB block
 cache (including index/filter blocks) and a 32 MiB write-buffer flush target, with

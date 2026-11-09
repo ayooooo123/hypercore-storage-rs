@@ -36,11 +36,16 @@ fn tree_lock(pointer: u64) -> usize {
 #[derive(Clone, Copy, Debug)]
 pub struct StoreOptions {
     pub wal: bool,
+    /// A fresh, process-local RocksDB filesystem; never writes cache files to disk.
+    pub memory: bool,
 }
 
 impl Default for StoreOptions {
     fn default() -> Self {
-        Self { wal: true }
+        Self {
+            wal: true,
+            memory: false,
+        }
     }
 }
 
@@ -72,8 +77,14 @@ impl Store {
     }
 
     pub fn open_with_options(dir: &Path, options: StoreOptions) -> Result<Store> {
-        std::fs::create_dir_all(dir)?;
-        Self::from_db(db::open(&dir.join("db"), false)?, false, options.wal)
+        if !options.memory {
+            std::fs::create_dir_all(dir)?;
+        }
+        Self::from_db(
+            db::open_with_memory(&dir.join("db"), false, options.memory)?,
+            false,
+            options.wal && !options.memory,
+        )
     }
 
     pub fn open_read_only(dir: &Path) -> Result<Store> {
@@ -1313,6 +1324,61 @@ impl CoreTx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_store_reclaims_blobs_without_files_and_reopens_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer");
+        let options = StoreOptions {
+            memory: true,
+            ..Default::default()
+        };
+        let store = Store::open_with_options(&path, options).unwrap();
+        let storage = store
+            .create_core(CreateCore {
+                key: [1; 32],
+                discovery_key: [2; 32],
+                ..Default::default()
+            })
+            .unwrap();
+        for start in (0..32).step_by(4) {
+            let mut tx = storage.write();
+            for index in start..start + 4 {
+                tx.put_block(index, Bytes::from(vec![index as u8; 512 * 1024]));
+            }
+            storage.flush(tx).unwrap();
+            store.flush().unwrap();
+        }
+        let blob_bytes = || {
+            store
+                .with_db(|db, cf| {
+                    db.property_int_value_cf(cf, "rocksdb.live-blob-file-size")
+                        .map(|bytes| bytes.unwrap_or(0))
+                        .map_err(|e| Error::Rocks(e.to_string()))
+                })
+                .unwrap()
+        };
+        let before = blob_bytes();
+        assert!(before > 0);
+        let mut tx = storage.write();
+        tx.delete_block_range(0, 24);
+        storage.flush(tx).unwrap();
+        store.compact(false).unwrap();
+        assert!(
+            blob_bytes() < before / 2,
+            "evicted blob storage must be freed"
+        );
+        assert!(storage.get_block(0).unwrap().is_none());
+        assert!(storage.get_block(31).unwrap().is_some());
+        // rust-rocksdb creates the empty directory before passing the path to MemEnv.
+        assert_eq!(std::fs::read_dir(path.join("db")).unwrap().count(), 0);
+        store.close();
+        drop(storage);
+        drop(store);
+        let reopened = Store::open_with_options(&path, options).unwrap();
+        assert!(reopened.cores().unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(path.join("db")).unwrap().count(), 0);
+    }
 
     #[test]
     fn tree_io_for_one_data_pointer_does_not_lock_another() {

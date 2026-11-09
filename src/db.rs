@@ -19,7 +19,15 @@ static WRITE_BUFFERS: LazyLock<WriteBufferManager> =
     LazyLock::new(|| WriteBufferManager::new_write_buffer_manager(32 * 1024 * 1024, false));
 
 pub(crate) fn open(path: &Path, read_only: bool) -> Result<DB> {
+    open_with_memory(path, read_only, false)
+}
+
+pub(crate) fn open_with_memory(path: &Path, read_only: bool, memory: bool) -> Result<DB> {
     let mut options = Options::default();
+    if memory {
+        let env = rocksdb::Env::mem_env().map_err(|e| Error::Rocks(e.to_string()))?;
+        options.set_env(&env);
+    }
     options.create_if_missing(!read_only);
     options.set_max_open_files(48);
     options.set_bytes_per_sync(1024 * 1024);
