@@ -44,14 +44,23 @@ assert_eq!(&block[..], b"hello");
 Rows this crate does not interpret (named-session dependencies, marks, local
 entries, extra bitfield kinds, group rows) are never rewritten or dropped.
 
+`Store::open_with_options(path, StoreOptions { wal: false })` is for a re-fetchable
+cache only. It skips WAL writes; a crash can discard unflushed whole batches
+(normal shutdown still flushes). Blocks, tree nodes and bitfield rows still
+commit atomically in one column family. `Store::open` keeps the WAL enabled for
+owned data, as before. No on-disk format changes.
+
 Runtime memory budgets are shared across stores in a process: an 8 MiB block
 cache (including index/filter blocks) and a 32 MiB write-buffer flush target, with
-two 8 MiB memtables per corestore column family and at most 48 open files per DB.
+two 12 MiB memtables (32 MiB on macOS) per corestore column family and at most 48 open files per DB.
 Each Corestore directory is one DB, not one DB per core or followed channel.
 These limits also apply to read-only opens; table/row formats are unchanged.
 The write-buffer target is soft: an atomic batch may exceed it. Global writer
 stalling is disabled because an oversized batch in an idle DB can otherwise
 block writes to another DB forever, including its first core's metadata.
+Incremental sync every 1 MiB and three background jobs (four on macOS), with two
+file-opening threads, match the JS worklet's I/O scheduling. The shared 32 MiB
+flush target stays soft; a slow disk can retain an active and an immutable memtable.
 
 Tree reads also share a per-store 32768-node LRU (about 4 MiB). It caches only
 present nodes, keyed by resolved data pointer and node index, and follows atomic
@@ -69,12 +78,17 @@ deletions lock all stripes before committing and invalidating the cache.
 
 This changes no row, table, or wire encoding.
 
-Manual `Store::compact(false)` matches streaming/ceiling reclamation: it is
-non-exclusive, skips bottommost rewrites and disables live-blob relocation.
-Only `compact(true)` forces relocation for a full viewer cache wipe. Manual
-passes are serialized because the Rust binding requires a temporary CF-wide GC
-override; background GC is restored afterward. These blocking calls belong on
-the host's blocking executor, not its HTTP/replication event loop.
+Automatic metadata compactions do not relocate live video blobs (age cutoff 0).
+`Store::compact(false)` is non-exclusive and first applies tombstones without
+relocation. If at least 25% of the remaining blob-file bytes are garbage, a second
+pass reclaims them; below that gate a mostly-live cache stays put. Retained blob
+space is therefore about 4/3 of live bytes between trims (excluding WAL/SST and
+temporary compaction output). Cast read-ahead reserves this overhead from physical
+free space; logical cache contribution settings are unchanged.
+`compact(true)` still forces relocation for an explicit full wipe. Manual passes
+are serialized because the Rust binding requires a temporary CF-wide GC override;
+the default cutoff 0 is restored afterward. These blocking calls belong on the
+host's blocking executor, not its HTTP/replication event loop.
 
 ## Tests
 

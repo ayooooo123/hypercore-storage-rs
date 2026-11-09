@@ -11,7 +11,7 @@ use bytes::Bytes;
 use compact_encoding::hypercore::Node;
 use rocksdb::{
     BottommostLevelCompaction, ColumnFamily, CompactOptions, DB, IteratorMode, ReadOptions,
-    WriteBatch,
+    WriteBatch, WriteOptions,
 };
 
 use crate::db::{self, COLUMN_FAMILY};
@@ -32,6 +32,17 @@ const TREE_LOCKS: usize = 32;
 fn tree_lock(pointer: u64) -> usize {
     (pointer % TREE_LOCKS as u64) as usize
 }
+/// Runtime durability policy. Disable the WAL only for re-fetchable caches.
+#[derive(Clone, Copy, Debug)]
+pub struct StoreOptions {
+    pub wal: bool,
+}
+
+impl Default for StoreOptions {
+    fn default() -> Self {
+        Self { wal: true }
+    }
+}
 
 /// A directory of cores in one RocksDB, in hypercore-storage's layout.
 #[derive(Clone)]
@@ -44,6 +55,7 @@ struct Inner {
     /// blocking every read that needs the same handle.
     db: Mutex<Option<Arc<DB>>>,
     read_only: bool,
+    write_options: WriteOptions,
     closed: AtomicBool,
     closed_rx: tokio::sync::watch::Sender<bool>,
     /// One writer at a time: creating a core reads and bumps the store head.
@@ -56,19 +68,26 @@ struct Inner {
 impl Store {
     /// Opens (or creates) the store in `<dir>/db`, as JS keeps it.
     pub fn open(dir: &Path) -> Result<Store> {
+        Self::open_with_options(dir, StoreOptions::default())
+    }
+
+    pub fn open_with_options(dir: &Path, options: StoreOptions) -> Result<Store> {
         std::fs::create_dir_all(dir)?;
-        Self::from_db(db::open(&dir.join("db"), false)?, false)
+        Self::from_db(db::open(&dir.join("db"), false)?, false, options.wal)
     }
 
     pub fn open_read_only(dir: &Path) -> Result<Store> {
-        Self::from_db(db::open(&dir.join("db"), true)?, true)
+        Self::from_db(db::open(&dir.join("db"), true)?, true, true)
     }
 
-    fn from_db(db: DB, read_only: bool) -> Result<Store> {
+    fn from_db(db: DB, read_only: bool, wal: bool) -> Result<Store> {
+        let mut write_options = WriteOptions::default();
+        write_options.disable_wal(!wal);
         Ok(Store {
             inner: Arc::new(Inner {
                 db: Mutex::new(Some(Arc::new(db))),
                 read_only,
+                write_options,
                 closed: AtomicBool::new(false),
                 closed_rx: tokio::sync::watch::channel(false).0,
                 write: Mutex::new(()),
@@ -109,7 +128,7 @@ impl Store {
     /// size-triggered compaction.
     ///
     /// `relocate_blobs` matches JS's exclusive full-wipe compaction with forced blob GC.
-    /// Streaming/ceiling compaction is non-exclusive and never relocates live blobs.
+    /// Streaming/ceiling passes relocate only once at least a quarter of blob bytes are garbage.
     pub fn compact(&self, relocate_blobs: bool) -> Result<()> {
         if self.inner.read_only {
             return Err(Error::ReadOnly);
@@ -123,13 +142,10 @@ impl Store {
         db.set_options_cf(
             &cf,
             &[
-                (
-                    "enable_blob_garbage_collection",
-                    if relocate_blobs { "true" } else { "false" },
-                ),
+                ("enable_blob_garbage_collection", "true"),
                 (
                     "blob_garbage_collection_age_cutoff",
-                    if relocate_blobs { "1.0" } else { "0.25" },
+                    if relocate_blobs { "1.0" } else { "0.0" },
                 ),
             ],
         )
@@ -142,11 +158,27 @@ impl Store {
             BottommostLevelCompaction::Skip
         });
         db.compact_range_cf_opt(&cf, None::<&[u8]>, None::<&[u8]>, &options);
+        if !relocate_blobs {
+            let size = db
+                .property_int_value_cf(&cf, "rocksdb.live-blob-file-size")
+                .map_err(|e| Error::Rocks(e.to_string()))?
+                .unwrap_or(0);
+            let garbage = db
+                .property_int_value_cf(&cf, "rocksdb.live-blob-file-garbage-size")
+                .map_err(|e| Error::Rocks(e.to_string()))?
+                .unwrap_or(0);
+            if garbage > 0 && garbage >= size.div_ceil(4) {
+                db.set_options_cf(&cf, &[("blob_garbage_collection_age_cutoff", "1.0")])
+                    .map_err(|e| Error::Rocks(e.to_string()))?;
+                options.set_bottommost_level_compaction(BottommostLevelCompaction::Force);
+                db.compact_range_cf_opt(&cf, None::<&[u8]>, None::<&[u8]>, &options);
+            }
+        }
         db.set_options_cf(
             &cf,
             &[
                 ("enable_blob_garbage_collection", "true"),
-                ("blob_garbage_collection_age_cutoff", "0.25"),
+                ("blob_garbage_collection_age_cutoff", "0.0"),
             ],
         )
         .map_err(|e| Error::Rocks(e.to_string()))?;
@@ -253,8 +285,8 @@ impl Store {
                         .unwrap_or_else(|e| e.into_inner())
                 })
             });
-            // JS writes with default options: atomic, WAL on, no per-batch fsync.
-            db.write(batch).map_err(|e| Error::Rocks(e.to_string()))?;
+            db.write_opt(batch, &self.inner.write_options)
+                .map_err(|e| Error::Rocks(e.to_string()))?;
             let mut cache = self.tree_cache();
             for op in ops {
                 match op {
@@ -1316,7 +1348,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_compaction_does_not_relocate_live_blobs() {
+    fn streaming_compaction_gates_relocation_and_reclaims_trimmed_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         store
@@ -1324,7 +1356,7 @@ mod tests {
                 db.set_options_cf(
                     cf,
                     &[
-                        ("blob_file_size", "1048576"),
+                        ("blob_file_size", "4194304"),
                         ("disable_auto_compactions", "true"),
                     ],
                 )
@@ -1338,9 +1370,11 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        for index in 0..16 {
+        for start in (0..16).step_by(4) {
             let mut tx = storage.write();
-            tx.put_block(index, Bytes::from(vec![index as u8; 1024 * 1024]));
+            for index in start..start + 4 {
+                tx.put_block(index, Bytes::from(vec![index as u8; 1024 * 1024]));
+            }
             storage.flush(tx).unwrap();
             store.flush().unwrap();
         }
@@ -1363,13 +1397,42 @@ mod tests {
         assert_eq!(
             blobs(),
             before,
-            "streaming GC must never relocate live blob files"
+            "a wholly live cache must not relocate blob files"
         );
         for index in 0..16 {
             assert_eq!(
                 storage.get_block(index).unwrap().unwrap(),
                 Bytes::from(vec![index as u8; 1024 * 1024])
             );
+        }
+        let mut tx = storage.write();
+        tx.delete_block(0);
+        storage.flush(tx).unwrap();
+        store.flush().unwrap();
+        store.compact(false).unwrap();
+        assert_eq!(blobs(), before, "a mostly live cache must stay put");
+        let before_bytes: u64 = before.iter().map(|p| p.metadata().unwrap().len()).sum();
+        let mut tx = storage.write();
+        for index in 0..16 {
+            if index % 4 < 2 {
+                tx.delete_block(index);
+            }
+        }
+        storage.flush(tx).unwrap();
+        store.flush().unwrap();
+        store.compact(false).unwrap();
+        let after_bytes: u64 = blobs().iter().map(|p| p.metadata().unwrap().len()).sum();
+        assert!(
+            after_bytes < before_bytes * 3 / 4,
+            "trimmed space was not reclaimed"
+        );
+        for index in 0..16 {
+            let block = storage.get_block(index).unwrap();
+            if index % 4 < 2 {
+                assert!(block.is_none());
+            } else {
+                assert_eq!(block.unwrap(), Bytes::from(vec![index as u8; 1024 * 1024]));
+            }
         }
     }
 }

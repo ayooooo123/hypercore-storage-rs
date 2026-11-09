@@ -40,7 +40,7 @@ pub use rows::{
     Alias, Auth, Core, CoreGroup, CoreHead, Dependency, GroupKey, GroupRow, Hints, Info, KeyPair,
     Session, StoreHead,
 };
-pub use store::{CoreStorage, CoreTx, CreateCore, InfoOptions, STORE_VERSION, Store};
+pub use store::{CoreStorage, CoreTx, CreateCore, InfoOptions, STORE_VERSION, Store, StoreOptions};
 
 /// Anything a store operation can fail with.
 #[derive(Debug)]
