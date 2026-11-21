@@ -9,7 +9,7 @@ opens in the other.
 | Path | Holds |
 |---|---|
 | `<dir>/db/` | RocksDB, one non-default column family named `corestore` (`hypercore-storage/index.js:13`, `526-537`, `1308-1330`) |
-| `<dir>/CORESTORE` | `device-file` lock plus `{"id": ...}`; JS only, never read or written here |
+| `<dir>/CORESTORE` | `device-file` lock and `key=value` metadata lines; JS only, never read or written here |
 | `<dir>/primary-key` | JS file from before `CORESTORE`; never written by 7.16.x |
 
 The column family options match JS: blob files from 4 KiB, 256 MiB blob files,

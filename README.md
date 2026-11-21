@@ -32,17 +32,18 @@ assert_eq!(&block[..], b"hello");
 
 * `Store` — the corestore level: store head (counters, primary key as `seed`,
   `defaultDiscoveryKey`), the discovery-key index, aliases, groups and their
-  update log, `get_infos`, `delete_core`, `clear`, `read_only`, `flush`, `close`.
+  update log, `get_infos`, `delete_core`, `clear`, `read_only`, `flush`, `suspend`,
+  `resume`, and `close`.
 * `CoreStorage` — one core and its current data pointer: auth, sessions, group,
-  head, hints, dependency, blocks, tree nodes, bitfield pages, user data, local
-  entries and marks, each read from its own row.
+  head, hints, blocks, tree nodes, bitfield pages, user data, local entries and
+  marks, each read from its own row.
 * `CoreTx` — JS `CoreTX` in snake_case: `set_auth`, `set_head`, `set_hints`,
   `put_block`, `delete_block_range`, `put_tree_node`, `put_bitfield_page`,
-  `put_user_data`, `put_local`, `put_mark`, sessions and dependencies. One
-  transaction is one atomic `WriteBatch`.
+  `put_user_data`, `put_local`, `put_mark`, and group updates. One transaction
+  is one atomic `WriteBatch`.
 
-Rows this crate does not interpret (named-session dependencies, marks, local
-entries, extra bitfield kinds, group rows) are never rewritten or dropped.
+Named-session rows written by JS are preserved. `delete_core` removes their data
+ranges with their parent core.
 
 `Store::open_with_options(path, StoreOptions { wal: false, ..Default::default() })` is for a re-fetchable
 cache only. It skips WAL writes; a crash can discard unflushed whole batches
@@ -69,18 +70,18 @@ file-opening threads, match the JS worklet's I/O scheduling. The shared 32 MiB
 flush target stays soft; a slow disk can retain an active and an immutable memtable.
 
 Tree reads also share a per-store 32768-node LRU (about 4 MiB). It caches only
-present nodes, keyed by resolved data pointer and node index, and follows atomic
-overwrites and deletions, including named-session dependencies. `get_tree_nodes`
-preserves input order and uses one RocksDB multi-get for multiple cache misses
-(a single miss uses one get without multi-get setup).
+present nodes, keyed by data pointer and node index, and follows atomic
+overwrites and deletions. `get_tree_nodes` preserves input order and uses one
+RocksDB multi-get for multiple cache misses (a single miss uses one get without
+multi-get setup).
 `missing_tree_nodes` consumes an ancestor iterator only up to a cached node,
 then batches the unresolved prefix; a cache hit allocates nothing. Committed
 tree writes populate the cache from their decoded nodes without decoding them again.
 The cache grows on demand rather than reserving its full capacity at store open.
 Tree I/O is synchronized by data pointer (32 fixed lock stripes), while the one
 shared LRU mutex protects only cache operations, never RocksDB reads or writes.
-Multi-get and named-session reads lock their dependency pointers in stripe order;
-deletions lock all stripes before committing and invalidating the cache.
+Tree writes and tree-only deletes lock only that data pointer's stripe; other
+deletes do not take a tree stripe or evict tree entries.
 
 This changes no row, table, or wire encoding.
 
@@ -96,13 +97,20 @@ are serialized because the Rust binding requires a temporary CF-wide GC override
 the default cutoff 0 is restored afterward. These blocking calls belong on the
 host's blocking executor, not its HTTP/replication event loop.
 
+## Deviations from npm
+
+`Store::suspend()` flushes the WAL and memtables, closes the RocksDB handle, and
+reopens it in `resume()`. This releases the RocksDB directory lock while
+suspended. Operations started while suspended wait for `resume()`; `close()`
+wakes them with `Error::Closed`. Memory stores leave their in-memory database
+open, so suspend and resume are no-ops.
+
 ## Tests
 
-`cargo test` runs row-level round trips against the raw layout, including a
-reopen and a session. It needs `compact-encoding-rs` and `hyperschema-rs`
-checked out next to this repo (`../compact-encoding-rs`, `../hyperschema-rs`),
-as CI does. The JS interop tests live in `hypercore-rs`
-(`tests/storage_switch.rs`, `tests/storage_crash.rs`).
+`cargo test` runs row-level round trips against the raw layout. It needs
+`compact-encoding-rs` and `hyperschema-rs` checked out next to this repo
+(`../compact-encoding-rs`, `../hyperschema-rs`), as CI does. The JS interop
+tests live in `hypercore-rs` (`tests/storage_switch.rs`, `tests/storage_crash.rs`).
 
 ## Throughput
 

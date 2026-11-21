@@ -23,7 +23,6 @@ pub const CORE_GROUP: u64 = 2;
 
 /// Kinds under a `TL_DATA` row.
 pub const DATA_HEAD: u64 = 0;
-pub const DATA_DEPENDENCY: u64 = 1;
 pub const DATA_HINTS: u64 = 2;
 pub const DATA_BLOCK: u64 = 3;
 pub const DATA_TREE: u64 = 4;
@@ -242,10 +241,6 @@ fn data_key(pointer: u64, kind: u64) -> Vec<u8> {
 
 pub fn data_head(pointer: u64) -> Vec<u8> {
     data_key(pointer, DATA_HEAD)
-}
-
-pub fn data_dependency(pointer: u64) -> Vec<u8> {
-    data_key(pointer, DATA_DEPENDENCY)
 }
 
 pub fn data_hints(pointer: u64) -> Vec<u8> {

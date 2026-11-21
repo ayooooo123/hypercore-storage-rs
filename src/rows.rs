@@ -3,6 +3,8 @@
 //! Values are the bare schema encoding, with no length or version prefix except
 //! the store head, whose versioned type carries its own version byte.
 
+use std::fmt;
+
 use bytes::Bytes;
 use compact_encoding::hypercore::{Manifest, Node};
 use compact_encoding::{Codec, Reader, Writer};
@@ -11,7 +13,7 @@ use crate::encoding::{core as core_schema, corestore as store_schema};
 use crate::{Error, Result};
 
 /// The store-level head (`@corestore/head`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct StoreHead {
     pub cores: u64,
     pub datas: u64,
@@ -19,6 +21,18 @@ pub struct StoreHead {
     /// The corestore primary key, stored as the head's `seed`.
     pub seed: Option<[u8; 32]>,
     pub default_discovery_key: Option<[u8; 32]>,
+}
+
+impl fmt::Debug for StoreHead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoreHead")
+            .field("cores", &self.cores)
+            .field("datas", &self.datas)
+            .field("groups", &self.groups)
+            .field("seed", &self.seed.as_ref().map(|_| "<redacted>"))
+            .field("default_discovery_key", &self.default_discovery_key)
+            .finish()
+    }
 }
 
 impl StoreHead {
@@ -118,23 +132,50 @@ impl Hints {
 }
 
 /// The ed25519 key pair in a core's auth row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct KeyPair {
     pub public_key: [u8; 32],
     pub secret_key: Option<[u8; 64]>,
+}
+
+impl fmt::Debug for KeyPair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyPair")
+            .field("public_key", &self.public_key)
+            .field(
+                "secret_key",
+                &self.secret_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// A core's auth row (`@core/auth`).
 ///
 /// Written by hand: the manifest is framed and uses hypercore's manifest codec
 /// (with its version-0 compatibility cases), not the plain schema struct.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct Auth {
     pub key: [u8; 32],
     pub discovery_key: [u8; 32],
     pub manifest: Option<Manifest>,
     pub key_pair: Option<KeyPair>,
     pub encryption_key: Option<Bytes>,
+}
+
+impl fmt::Debug for Auth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Auth")
+            .field("key", &self.key)
+            .field("discovery_key", &self.discovery_key)
+            .field("manifest", &self.manifest)
+            .field("key_pair", &self.key_pair)
+            .field(
+                "encryption_key",
+                &self.encryption_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl Auth {
@@ -244,30 +285,6 @@ impl Core {
     }
 }
 
-/// A session dependency (`@core/dependency`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Dependency {
-    pub data_pointer: u64,
-    pub length: u64,
-}
-
-impl Dependency {
-    pub fn encode(&self) -> Bytes {
-        compact_encoding::encode(&core_schema::Dependency {
-            data_pointer: self.data_pointer,
-            length: self.length,
-        })
-    }
-
-    pub fn decode(bytes: Bytes) -> Result<Self> {
-        let dependency = core_schema::Dependency::decode(&mut Reader::new(bytes))?;
-        Ok(Self {
-            data_pointer: dependency.data_pointer,
-            length: dependency.length,
-        })
-    }
-}
-
 /// A named session (`@core/session`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
@@ -340,13 +357,25 @@ pub struct GroupRow {
 }
 
 /// Everything `getInfos` returns for one discovery key.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Info {
     pub discovery_key: [u8; 32],
     pub core: Core,
     pub auth: Option<Auth>,
     pub head: Option<CoreHead>,
     pub hints: Option<Hints>,
+}
+
+impl fmt::Debug for Info {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Info")
+            .field("discovery_key", &self.discovery_key)
+            .field("core", &self.core)
+            .field("auth", &self.auth)
+            .field("head", &self.head)
+            .field("hints", &self.hints)
+            .finish()
+    }
 }
 
 /// Encodes a tree node exactly as `@core/tree-node` does.

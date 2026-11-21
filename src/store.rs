@@ -3,12 +3,13 @@
 //! The structure follows npm `hypercore-storage`'s `CorestoreStorage`,
 //! `HypercoreStorage`, `CoreTX` and `CoreRX`; the naming is snake_case.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 
 use bytes::Bytes;
 use compact_encoding::hypercore::Node;
+use compact_encoding::{Reader, Writer};
 use rocksdb::{
     BottommostLevelCompaction, ColumnFamily, CompactOptions, DB, IteratorMode, ReadOptions,
     WriteBatch, WriteOptions,
@@ -17,15 +18,12 @@ use rocksdb::{
 use crate::db::{self, COLUMN_FAMILY};
 use crate::keys;
 use crate::rows::{
-    Alias, Auth, Core, CoreGroup, CoreHead, Dependency, GroupRow, Hints, Info, Session, StoreHead,
+    Alias, Auth, Core, CoreGroup, CoreHead, GroupRow, Hints, Info, Session, StoreHead,
 };
 use crate::{Error, Result};
 
 /// Version this crate writes in `@corestore/core` and `@corestore/head`.
 pub const STORE_VERSION: u64 = 2;
-
-/// The deepest dependency chain `resume_core` follows before giving up.
-const MAX_DEPENDENCIES: usize = 64;
 
 const TREE_LOCKS: usize = 32;
 
@@ -59,10 +57,17 @@ struct Inner {
     /// An `Arc` so a compaction can drop the lock while it rewrites files, instead of
     /// blocking every read that needs the same handle.
     db: Mutex<Option<Arc<DB>>>,
+    db_path: PathBuf,
+    memory: bool,
     read_only: bool,
     write_options: WriteOptions,
     closed: AtomicBool,
     closed_rx: tokio::sync::watch::Sender<bool>,
+    /// Database accesses hold it shared; suspend, resume and close hold it exclusively.
+    access_gate: RwLock<()>,
+    /// Set while the RocksDB handle is closed for suspension.
+    suspended: Mutex<bool>,
+    resumed: Condvar,
     /// One writer at a time: creating a core reads and bumps the store head.
     write: Mutex<()>,
     compact: Mutex<()>,
@@ -80,27 +85,42 @@ impl Store {
         if !options.memory {
             std::fs::create_dir_all(dir)?;
         }
+        let db_path = dir.join("db");
         Self::from_db(
-            db::open_with_memory(&dir.join("db"), false, options.memory)?,
+            db::open_with_memory(&db_path, false, options.memory)?,
+            db_path,
+            options.memory,
             false,
             options.wal && !options.memory,
         )
     }
 
     pub fn open_read_only(dir: &Path) -> Result<Store> {
-        Self::from_db(db::open(&dir.join("db"), true)?, true, true)
+        let db_path = dir.join("db");
+        Self::from_db(db::open(&db_path, true)?, db_path, false, true, true)
     }
 
-    fn from_db(db: DB, read_only: bool, wal: bool) -> Result<Store> {
+    fn from_db(
+        db: DB,
+        db_path: PathBuf,
+        memory: bool,
+        read_only: bool,
+        wal: bool,
+    ) -> Result<Store> {
         let mut write_options = WriteOptions::default();
         write_options.disable_wal(!wal);
         Ok(Store {
             inner: Arc::new(Inner {
                 db: Mutex::new(Some(Arc::new(db))),
+                db_path,
+                memory,
                 read_only,
                 write_options,
                 closed: AtomicBool::new(false),
                 closed_rx: tokio::sync::watch::channel(false).0,
+                access_gate: RwLock::new(()),
+                suspended: Mutex::new(false),
+                resumed: Condvar::new(),
                 write: Mutex::new(()),
                 compact: Mutex::new(()),
                 tree_cache: Mutex::new(Default::default()),
@@ -115,18 +135,100 @@ impl Store {
 
     /// Whether [`Store::close`] has run.
     pub fn is_closed(&self) -> bool {
-        self.inner.closed.load(Ordering::Acquire) || self.lock_db().is_none()
+        self.inner.closed.load(Ordering::Acquire)
     }
 
     pub fn close(&self) {
+        let _access = self
+            .inner
+            .access_gate
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
         self.inner.closed.store(true, Ordering::Release);
-        self.lock_db().take();
+        let db = self.lock_db().take();
+        drop(db);
         let _ = self.inner.closed_rx.send(true);
+        let _suspended = self
+            .inner
+            .suspended
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        self.inner.resumed.notify_all();
     }
 
     /// A receiver that flips to `true` once [`Store::close`] has run.
     pub fn closed(&self) -> tokio::sync::watch::Receiver<bool> {
         self.inner.closed_rx.subscribe()
+    }
+
+    /// Flushes and closes RocksDB until [`Store::resume`]. A memory store has no
+    /// files or lock to release and would lose its data on close, so it stays open.
+    ///
+    /// The host must call [`Store::resume`] from a thread that is not blocked in a
+    /// store access.
+    pub fn suspend(&self) -> Result<()> {
+        if self.inner.memory {
+            return Ok(());
+        }
+        let _access = self
+            .inner
+            .access_gate
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut suspended = self
+            .inner
+            .suspended
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if *suspended {
+            return Ok(());
+        }
+        let db = self.handle()?;
+        let cf = db
+            .cf_handle(COLUMN_FAMILY)
+            .ok_or_else(|| Error::Corrupt("missing corestore column family".into()))?;
+        db.flush_wal(true)
+            .map_err(|e| Error::Rocks(e.to_string()))?;
+        db.flush_cf(&cf).map_err(|e| Error::Rocks(e.to_string()))?;
+        let closed_db = self.lock_db().take();
+        *suspended = true;
+        drop(db);
+        drop(closed_db);
+        Ok(())
+    }
+
+    /// Reopens RocksDB after [`Store::suspend`] and wakes waiting accesses.
+    ///
+    /// The host must call this from a thread that is not blocked in a store access.
+    pub fn resume(&self) -> Result<()> {
+        if self.inner.memory {
+            return Ok(());
+        }
+        let _access = self
+            .inner
+            .access_gate
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.is_closed() {
+            return Err(Error::Closed);
+        }
+        let mut suspended = self
+            .inner
+            .suspended
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !*suspended {
+            return Ok(());
+        }
+        let db = if self.inner.read_only {
+            db::open(&self.inner.db_path, true)?
+        } else {
+            db::open_with_memory(&self.inner.db_path, false, self.inner.memory)?
+        };
+        *self.lock_db() = Some(Arc::new(db));
+        *suspended = false;
+        self.inner.resumed.notify_all();
+        Ok(())
     }
 
     /// Flushes the memtable, as JS `storage.flush()` does.
@@ -144,6 +246,7 @@ impl Store {
         if self.inner.read_only {
             return Err(Error::ReadOnly);
         }
+        let _access = self.access_gate()?;
         let _compact = self.inner.compact.lock().unwrap_or_else(|e| e.into_inner());
         let db = self.handle()?;
         let cf = db
@@ -207,6 +310,43 @@ impl Store {
         self.lock_db().as_ref().cloned().ok_or(Error::Closed)
     }
 
+    fn access_gate(&self) -> Result<RwLockReadGuard<'_, ()>> {
+        loop {
+            let mut suspended = self
+                .inner
+                .suspended
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            while *suspended && !self.is_closed() {
+                suspended = self
+                    .inner
+                    .resumed
+                    .wait(suspended)
+                    .unwrap_or_else(|poison| poison.into_inner());
+            }
+            if self.is_closed() {
+                return Err(Error::Closed);
+            }
+            drop(suspended);
+
+            let access = self
+                .inner
+                .access_gate
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let suspended = self
+                .inner
+                .suspended
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if !*suspended && !self.is_closed() {
+                return Ok(access);
+            }
+            drop(suspended);
+            drop(access);
+        }
+    }
+
     fn tree_cache(&self) -> MutexGuard<'_, crate::tree_cache::TreeCache> {
         self.inner
             .tree_cache
@@ -215,6 +355,7 @@ impl Store {
     }
 
     fn with_db<T>(&self, f: impl FnOnce(&DB, &ColumnFamily) -> Result<T>) -> Result<T> {
+        let _access = self.access_gate()?;
         let db = self.handle()?;
         let cf = db
             .cf_handle(COLUMN_FAMILY)
@@ -281,13 +422,31 @@ impl Store {
                     ),
                     Op::Delete(key) => batch.delete_cf(cf, key),
                     Op::DeleteRange(start, end) => batch.delete_range_cf(cf, start, end),
+                    Op::DeleteTree(pointer, index) => {
+                        batch.delete_cf(cf, keys::data_tree(*pointer, *index))
+                    }
+                    Op::DeleteTreeRange(pointer, start, end) => batch.delete_range_cf(
+                        cf,
+                        keys::data_tree(*pointer, *start),
+                        keys::data_tree(*pointer, *end),
+                    ),
+                    Op::DeleteTreeAll(pointer) => batch.delete_range_cf(
+                        cf,
+                        keys::data_tree_start(*pointer),
+                        keys::data_bitfield_start(*pointer),
+                    ),
+                    Op::Clear => {
+                        batch.delete_range_cf(cf, keys::uint_key(0), keys::uint_key(keys::TL_END))
+                    }
                 }
             }
-            // Different data pointers may commit concurrently; cache fills must follow their writes.
             let mask = ops.iter().fold(0u32, |mask, op| match op {
-                Op::PutTree(pointer, _) => mask | (1 << tree_lock(*pointer)),
-                Op::Delete(_) | Op::DeleteRange(_, _) => u32::MAX,
-                Op::Put(_, _) => mask,
+                Op::PutTree(pointer, _)
+                | Op::DeleteTree(pointer, _)
+                | Op::DeleteTreeRange(pointer, _, _)
+                | Op::DeleteTreeAll(pointer) => mask | (1 << tree_lock(*pointer)),
+                Op::Clear => u32::MAX,
+                Op::Put(_, _) | Op::Delete(_) | Op::DeleteRange(_, _) => mask,
             });
             let _writes: [_; TREE_LOCKS] = std::array::from_fn(|i| {
                 (mask & (1 << i) != 0).then(|| {
@@ -302,8 +461,13 @@ impl Store {
             for op in ops {
                 match op {
                     Op::PutTree(pointer, node) => cache.put(pointer, node),
-                    Op::Put(_, _) => {}
-                    Op::Delete(_) | Op::DeleteRange(_, _) => cache.clear(),
+                    Op::DeleteTree(pointer, index) => cache.delete(pointer, index),
+                    Op::DeleteTreeRange(pointer, start, end) => {
+                        cache.delete_range(pointer, start, end)
+                    }
+                    Op::DeleteTreeAll(pointer) => cache.delete_all(pointer),
+                    Op::Clear => cache.clear(),
+                    Op::Put(_, _) | Op::Delete(_) | Op::DeleteRange(_, _) => {}
                 }
             }
             Ok(())
@@ -421,6 +585,9 @@ impl Store {
             return self.core_from(core);
         }
         let core = self.write_with(|store| {
+            if let Some(core) = store.get_core(&options.discovery_key)? {
+                return Ok((Vec::new(), core));
+            }
             let mut head = store.head()?;
             if head.default_discovery_key.is_none() {
                 head.default_discovery_key = Some(options.discovery_key);
@@ -472,30 +639,22 @@ impl Store {
         self.core_from(core)
     }
 
-    /// A handle for an existing core, following its dependency chain.
+    /// A handle for an existing core.
     pub fn resume_core(&self, discovery_key: &[u8; 32]) -> Result<Option<CoreStorage>> {
         match self.get_core(discovery_key)? {
-            Some(core) => Ok(Some(self.core_from(core)?)),
-            None => Ok(None),
+            Some(core) if core.version != 0 => Ok(Some(self.core_from(core)?)),
+            Some(_) | None => Ok(None),
         }
     }
 
     fn core_from(&self, core: Core) -> Result<CoreStorage> {
-        let mut dependencies = Vec::new();
-        let mut data_pointer = core.data_pointer;
-        for _ in 0..MAX_DEPENDENCIES {
-            let Some(bytes) = self.get(&keys::data_dependency(data_pointer))? else {
-                break;
-            };
-            let dependency = Dependency::decode(bytes)?;
-            dependencies.push(dependency);
-            data_pointer = dependency.data_pointer;
+        if core.version == 0 {
+            return Err(Error::Corrupt("core version 0 requires migration".into()));
         }
         Ok(CoreStorage {
             store: self.clone(),
             core_pointer: core.core_pointer,
             data_pointer: core.data_pointer,
-            dependencies,
         })
     }
 
@@ -530,11 +689,28 @@ impl Store {
                 keys::data_range_start(core.data_pointer),
                 keys::data_range_end(core.data_pointer),
             ));
+            ops.push(Op::DeleteTreeAll(core.data_pointer));
+            if let Some(group) = store
+                .get(&keys::core_group(core.core_pointer))?
+                .map(CoreGroup::decode)
+                .transpose()?
+                && let Some(head) = store
+                    .get(&keys::data_head(core.data_pointer))?
+                    .map(CoreHead::decode)
+                    .transpose()?
+            {
+                ops.push(Op::Delete(keys::group_entry(
+                    group.pointer,
+                    head.timestamp,
+                    core.core_pointer,
+                )));
+            }
             for session in sessions {
                 ops.push(Op::DeleteRange(
                     keys::data_range_start(session.data_pointer),
                     keys::data_range_end(session.data_pointer),
                 ));
+                ops.push(Op::DeleteTreeAll(session.data_pointer));
             }
             Ok((ops, ()))
         })
@@ -552,6 +728,10 @@ impl Store {
                 out.push(None);
                 continue;
             };
+            if core.version == 0 {
+                out.push(None);
+                continue;
+            }
             let auth = if options.auth {
                 self.auth_at(core.core_pointer)?
             } else {
@@ -654,15 +834,18 @@ impl Store {
             return Ok(group);
         }
         self.write_with(|store| {
+            if let Some(group) = store.get_group(topic)? {
+                return Ok((Vec::new(), group));
+            }
             let mut head = store.head()?;
             let group = head.groups;
             head.groups += 1;
-            let mut value = Vec::new();
-            keys::uint(&mut value, group);
+            let mut value = Writer::new();
+            value.uint(group);
             Ok((
                 vec![
                     Op::Put(keys::store_head(), head.encode()),
-                    Op::Put(keys::group_topic(topic), value.into()),
+                    Op::Put(keys::group_topic(topic), value.finish()),
                 ],
                 group,
             ))
@@ -671,10 +854,10 @@ impl Store {
 
     pub fn get_group(&self, topic: &[u8; 32]) -> Result<Option<u64>> {
         match self.get(&keys::group_topic(topic))? {
-            Some(value) => {
-                let mut pos = 0;
-                Ok(keys::read_uint(&value, &mut pos))
-            }
+            Some(value) => Reader::new(value)
+                .uint()
+                .map(Some)
+                .map_err(|e| Error::Corrupt(format!("invalid group pointer: {e}"))),
             None => Ok(None),
         }
     }
@@ -730,15 +913,7 @@ impl Store {
 
     /// Removes every row (`store.clear()`).
     pub fn clear(&self) -> Result<()> {
-        self.write_with(|_| {
-            Ok((
-                vec![Op::DeleteRange(
-                    keys::uint_key(0),
-                    keys::uint_key(keys::TL_END),
-                )],
-                (),
-            ))
-        })
+        self.write_with(|_| Ok((vec![Op::Clear], ())))
     }
 }
 
@@ -774,13 +949,12 @@ impl Default for InfoOptions {
     }
 }
 
-/// One core plus its current data pointer and dependency chain.
+/// One core plus its current data pointer.
 #[derive(Clone)]
 pub struct CoreStorage {
     store: Store,
     core_pointer: u64,
     data_pointer: u64,
-    dependencies: Vec<Dependency>,
 }
 
 impl CoreStorage {
@@ -794,10 +968,6 @@ impl CoreStorage {
 
     pub fn data_pointer(&self) -> u64 {
         self.data_pointer
-    }
-
-    pub fn dependencies(&self) -> &[Dependency] {
-        &self.dependencies
     }
 
     // ---- reads ------------------------------------------------------------
@@ -824,13 +994,6 @@ impl CoreStorage {
         }
     }
 
-    pub fn get_dependency(&self) -> Result<Option<Dependency>> {
-        match self.store.get(&keys::data_dependency(self.data_pointer))? {
-            Some(bytes) => Ok(Some(Dependency::decode(bytes)?)),
-            None => Ok(None),
-        }
-    }
-
     pub fn get_hints(&self) -> Result<Option<Hints>> {
         match self.store.get(&keys::data_hints(self.data_pointer))? {
             Some(bytes) => Ok(Some(Hints::decode(bytes)?)),
@@ -838,14 +1001,9 @@ impl CoreStorage {
         }
     }
 
-    /// Block `index`, looking in the oldest dependency that covers it first.
+    /// Block `index`.
     pub fn get_block(&self, index: u64) -> Result<Option<Bytes>> {
-        let pointer = self
-            .dependencies
-            .iter()
-            .find(|dependency| index < dependency.length)
-            .map_or(self.data_pointer, |dependency| dependency.data_pointer);
-        self.store.get(&keys::data_block(pointer, index))
+        self.store.get(&keys::data_block(self.data_pointer, index))
     }
 
     pub fn get_bitfield_page(&self, index: u64) -> Result<Option<Bytes>> {
@@ -853,44 +1011,30 @@ impl CoreStorage {
             .get(&keys::data_bitfield(self.data_pointer, index, 0))
     }
 
-    /// Tree node `index`, looking in the oldest dependency that covers it first.
+    /// Tree node `index`.
     pub fn get_tree_node(&self, index: u64) -> Result<Option<Node>> {
         self.store.with_db(|db, cf| {
-            let pointer = self.tree_pointer(index);
-            let _read = self.store.inner.tree_io[tree_lock(pointer)]
+            let _read = self.store.inner.tree_io[tree_lock(self.data_pointer)]
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(node) = self.store.tree_cache().get((pointer, index)) {
+            if let Some(node) = self.store.tree_cache().get((self.data_pointer, index)) {
                 return Ok(Some(node));
             }
             let node = db
-                .get_cf(cf, keys::data_tree(pointer, index))
+                .get_cf(cf, keys::data_tree(self.data_pointer, index))
                 .map_err(|e| Error::Rocks(e.to_string()))?
                 .map(|bytes| crate::rows::decode_tree_node(Bytes::from(bytes)))
                 .transpose()?;
             if let Some(node) = node {
-                self.store.tree_cache().put(pointer, node);
+                self.store.tree_cache().put(self.data_pointer, node);
             }
             Ok(node)
         })
     }
 
-    fn tree_pointer(&self, index: u64) -> u64 {
-        self.dependencies
-            .iter()
-            .find(|dependency| {
-                crate::flat::right_span(index) <= dependency.length.saturating_sub(1) * 2
-            })
-            .map_or(self.data_pointer, |dependency| dependency.data_pointer)
-    }
-
     fn tree_reads(&self) -> [Option<RwLockReadGuard<'_, ()>>; TREE_LOCKS] {
-        let mut mask = 1u32 << tree_lock(self.data_pointer);
-        for dependency in &self.dependencies {
-            mask |= 1 << tree_lock(dependency.data_pointer);
-        }
         std::array::from_fn(|i| {
-            (mask & (1 << i) != 0).then(|| {
+            (i == tree_lock(self.data_pointer)).then(|| {
                 self.store.inner.tree_io[i]
                     .read()
                     .unwrap_or_else(|e| e.into_inner())
@@ -898,7 +1042,7 @@ impl CoreStorage {
         })
     }
 
-    /// Ordered, dependency-aware tree reads in one RocksDB multi-get; cached nodes need no I/O.
+    /// Ordered tree reads in one RocksDB multi-get; cached nodes need no I/O.
     pub fn get_tree_nodes(&self, indices: &[u64]) -> Result<Vec<Option<Node>>> {
         self.store.with_db(|db, cf| {
             let _reads = self.tree_reads();
@@ -907,12 +1051,11 @@ impl CoreStorage {
             let mut missing = Vec::new();
             let mut row_keys = Vec::new();
             for (slot, &index) in indices.iter().enumerate() {
-                let pointer = self.tree_pointer(index);
-                let node = cache.get((pointer, index));
+                let node = cache.get((self.data_pointer, index));
                 out.push(node);
                 if node.is_none() {
-                    missing.push((slot, pointer));
-                    row_keys.push(keys::data_tree(pointer, index));
+                    missing.push(slot);
+                    row_keys.push(keys::data_tree(self.data_pointer, index));
                 }
             }
             drop(cache);
@@ -923,10 +1066,10 @@ impl CoreStorage {
                     db.multi_get_cf(row_keys.iter().map(|key| (cf, key)))
                 };
                 let mut cache = self.store.tree_cache();
-                for ((slot, pointer), value) in missing.into_iter().zip(values) {
+                for (slot, value) in missing.into_iter().zip(values) {
                     if let Some(bytes) = value.map_err(|e| Error::Rocks(e.to_string()))? {
                         let node = crate::rows::decode_tree_node(Bytes::from(bytes))?;
-                        cache.put(pointer, node);
+                        cache.put(self.data_pointer, node);
                         out[slot] = Some(node);
                     }
                 }
@@ -942,10 +1085,10 @@ impl CoreStorage {
             let mut cache = self.store.tree_cache();
             let mut row_keys = Vec::new();
             for index in indices {
-                if cache.get((self.tree_pointer(index), index)).is_some() {
+                if cache.get((self.data_pointer, index)).is_some() {
                     break;
                 }
-                row_keys.push(keys::data_tree(self.tree_pointer(index), index));
+                row_keys.push(keys::data_tree(self.data_pointer, index));
             }
             drop(cache);
             if row_keys.is_empty() {
@@ -959,9 +1102,7 @@ impl CoreStorage {
             for (slot, value) in values.into_iter().enumerate() {
                 if let Some(bytes) = value.map_err(|e| Error::Rocks(e.to_string()))? {
                     let node = crate::rows::decode_tree_node(Bytes::from(bytes))?;
-                    self.store
-                        .tree_cache()
-                        .put(self.tree_pointer(node.index), node);
+                    self.store.tree_cache().put(self.data_pointer, node);
                     return Ok(slot as u64);
                 }
             }
@@ -1054,103 +1195,6 @@ impl CoreStorage {
         }
         self.store.apply_ops(tx.ops)
     }
-
-    // ---- sessions ---------------------------------------------------------
-
-    /// JS `createSession(name, head)`: a named data pointer whose dependency
-    /// covers `head.length` blocks of the current data pointer.
-    pub fn create_session(&self, name: &str, head: Option<&CoreHead>) -> Result<CoreStorage> {
-        let current_head = self.get_head()?.unwrap_or_default();
-        let head = head.cloned().unwrap_or_else(|| current_head.clone());
-        if head.length > current_head.length {
-            return Err(Error::BadArgument(
-                "Invalid head passed, ahead of core".into(),
-            ));
-        }
-        let mut sessions = self.get_sessions()?;
-        let data_pointer = match sessions.iter().find(|session| session.name == name) {
-            Some(existing) => existing.data_pointer,
-            None => {
-                let pointer = self.store.alloc_data_pointer()?;
-                sessions.push(Session {
-                    name: name.to_string(),
-                    data_pointer: pointer,
-                });
-                pointer
-            }
-        };
-        // The sessions row lives under the core pointer; the head and dependency
-        // belong to the session's own data pointer. One transaction writes both,
-        // like JS's shared view flush.
-        let session = CoreStorage {
-            store: self.store.clone(),
-            core_pointer: self.core_pointer,
-            data_pointer,
-            dependencies: vec![Dependency {
-                data_pointer: self.data_pointer,
-                length: head.length,
-            }],
-        };
-        let mut tx = session.write();
-        tx.set_sessions(&sessions);
-        tx.set_dependency(session.dependencies[0]);
-        if head.length > 0 {
-            tx.set_head(&head);
-        }
-        session.flush(tx)?;
-        Ok(session)
-    }
-
-    /// JS `resumeSession(name)`.
-    pub fn resume_session(&self, name: &str) -> Result<Option<CoreStorage>> {
-        let Some(session) = self
-            .get_sessions()?
-            .into_iter()
-            .find(|session| session.name == name)
-        else {
-            return Ok(None);
-        };
-        let mut storage = CoreStorage {
-            store: self.store.clone(),
-            core_pointer: self.core_pointer,
-            data_pointer: session.data_pointer,
-            dependencies: Vec::new(),
-        };
-        if let Some(dependency) = storage.get_dependency()? {
-            storage.dependencies.push(dependency);
-        }
-        Ok(Some(storage))
-    }
-
-    /// JS `deleteSessions`.
-    pub fn delete_sessions(&self) -> Result<()> {
-        let sessions = self.get_sessions()?;
-        let mut tx = self.write();
-        tx.set_sessions(&[]);
-        self.flush(tx)?;
-        let ops = sessions
-            .into_iter()
-            .map(|session| {
-                Op::DeleteRange(
-                    keys::data_range_start(session.data_pointer),
-                    keys::data_range_end(session.data_pointer),
-                )
-            })
-            .collect();
-        self.store.apply_ops(ops)
-    }
-}
-
-impl Store {
-    /// Bumps the data pointer counter (`_allocData`).
-    fn alloc_data_pointer(&self) -> Result<u64> {
-        self.write_with(|store| {
-            let mut head = store.head()?;
-            let pointer = head.datas;
-            head.datas += 1;
-            Ok((vec![Op::Put(keys::store_head(), head.encode())], pointer))
-        })
-    }
 }
 
 enum Op {
@@ -1158,6 +1202,10 @@ enum Op {
     PutTree(u64, Node),
     Delete(Vec<u8>),
     DeleteRange(Vec<u8>, Vec<u8>),
+    DeleteTree(u64, u64),
+    DeleteTreeRange(u64, u64, u64),
+    DeleteTreeAll(u64),
+    Clear,
 }
 
 /// Pending writes for one core, in JS `CoreTX`'s shape.
@@ -1188,13 +1236,6 @@ impl CoreTx {
         self.put(keys::core_auth(self.core_pointer), auth.encode());
     }
 
-    pub fn set_sessions(&mut self, sessions: &[Session]) {
-        self.put(
-            keys::core_sessions(self.core_pointer),
-            Session::encode_list(sessions),
-        );
-    }
-
     pub fn set_group(&mut self, group: Option<CoreGroup>) {
         match group {
             Some(group) => self.put(keys::core_group(self.core_pointer), group.encode()),
@@ -1221,13 +1262,6 @@ impl CoreTx {
 
     pub fn delete_head(&mut self) {
         self.delete(keys::data_head(self.data_pointer));
-    }
-
-    pub fn set_dependency(&mut self, dependency: Dependency) {
-        self.put(
-            keys::data_dependency(self.data_pointer),
-            dependency.encode(),
-        );
     }
 
     pub fn set_hints(&mut self, hints: &Hints) {
@@ -1269,14 +1303,12 @@ impl CoreTx {
     }
 
     pub fn delete_tree_node(&mut self, index: u64) {
-        self.delete(keys::data_tree(self.data_pointer, index));
+        self.ops.push(Op::DeleteTree(self.data_pointer, index));
     }
 
     pub fn delete_tree_range(&mut self, start: u64, end: u64) {
-        self.delete_range(
-            keys::data_tree(self.data_pointer, start),
-            keys::data_tree(self.data_pointer, end),
-        );
+        self.ops
+            .push(Op::DeleteTreeRange(self.data_pointer, start, end));
     }
 
     pub fn put_user_data(&mut self, key: &str, value: Option<Bytes>) {
@@ -1500,5 +1532,92 @@ mod tests {
                 assert_eq!(block.unwrap(), Bytes::from(vec![index as u8; 1024 * 1024]));
             }
         }
+    }
+
+    #[test]
+    fn group_pointers_use_compact_uint_bytes() {
+        const CASES: &[(u64, &[u8])] = &[
+            (252, &[0xfc]),
+            (253, &[0xfd, 0xfd, 0x00]),
+            (65_536, &[0xfe, 0x00, 0x00, 0x01, 0x00]),
+        ];
+        for (group, expected) in CASES {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path()).unwrap();
+            let head = StoreHead {
+                groups: *group,
+                ..Default::default()
+            };
+            store
+                .apply_ops(vec![Op::Put(keys::store_head(), head.encode())])
+                .unwrap();
+            let topic = [*group as u8; 32];
+            assert_eq!(store.create_group(&topic).unwrap(), *group);
+            assert_eq!(
+                store.get(&keys::group_topic(&topic)).unwrap().as_deref(),
+                Some(*expected)
+            );
+            assert_eq!(store.get_group(&topic).unwrap(), Some(*group));
+        }
+    }
+
+    #[test]
+    fn version_zero_core_is_not_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let discovery_key = [7; 32];
+        let core = Core {
+            version: 0,
+            core_pointer: 0,
+            data_pointer: 0,
+            alias: None,
+        };
+        store
+            .apply_ops(vec![Op::Put(
+                keys::core_by_discovery_key(&discovery_key),
+                core.encode(),
+            )])
+            .unwrap();
+        assert!(store.resume_core(&discovery_key).unwrap().is_none());
+        assert!(
+            store
+                .get_infos(&[discovery_key], InfoOptions::default())
+                .unwrap()[0]
+                .is_none()
+        );
+        assert!(matches!(
+            store.create_core(CreateCore {
+                discovery_key,
+                ..Default::default()
+            }),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn suspension_releases_the_database_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.suspend().unwrap();
+        let reopened = Store::open(dir.path()).unwrap();
+        reopened.close();
+        store.resume().unwrap();
+        assert_eq!(store.head().unwrap(), StoreHead::default());
+    }
+
+    #[test]
+    fn concurrent_accesses_hold_the_shared_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let first_store = store.clone();
+        let first_barrier = barrier.clone();
+        let first = std::thread::spawn(move || {
+            let _access = first_store.access_gate().unwrap();
+            first_barrier.wait();
+        });
+        let _access = store.access_gate().unwrap();
+        barrier.wait();
+        first.join().unwrap();
     }
 }

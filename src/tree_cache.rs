@@ -40,6 +40,81 @@ impl TreeCache {
         self.oldest = NONE;
     }
 
+    fn remove_at(&mut self, slot: usize) {
+        let Entry {
+            key,
+            previous,
+            next,
+            ..
+        } = self.entries[slot];
+        self.indices.remove(&key);
+        if previous != NONE {
+            self.entries[previous].next = next;
+        } else {
+            self.oldest = next;
+        }
+        if next != NONE {
+            self.entries[next].previous = previous;
+        } else {
+            self.newest = previous;
+        }
+
+        let Some(last) = self.entries.len().checked_sub(1) else {
+            return;
+        };
+        if slot == last {
+            self.entries.pop();
+            return;
+        }
+        let Some(moved) = self.entries.pop() else {
+            return;
+        };
+        let moved_key = moved.key;
+        let moved_previous = moved.previous;
+        let moved_next = moved.next;
+        self.entries[slot] = moved;
+        self.indices.insert(moved_key, slot);
+        if moved_previous != NONE {
+            self.entries[moved_previous].next = slot;
+        } else {
+            self.oldest = slot;
+        }
+        if moved_next != NONE {
+            self.entries[moved_next].previous = slot;
+        } else {
+            self.newest = slot;
+        }
+    }
+
+    pub(crate) fn delete(&mut self, pointer: u64, index: u64) {
+        if let Some(&slot) = self.indices.get(&(pointer, index)) {
+            self.remove_at(slot);
+        }
+    }
+
+    pub(crate) fn delete_range(&mut self, pointer: u64, start: u64, end: u64) {
+        let mut slot = 0;
+        while slot < self.entries.len() {
+            let (entry_pointer, index) = self.entries[slot].key;
+            if entry_pointer == pointer && (start..end).contains(&index) {
+                self.remove_at(slot);
+            } else {
+                slot += 1;
+            }
+        }
+    }
+
+    pub(crate) fn delete_all(&mut self, pointer: u64) {
+        let mut slot = 0;
+        while slot < self.entries.len() {
+            if self.entries[slot].key.0 == pointer {
+                self.remove_at(slot);
+            } else {
+                slot += 1;
+            }
+        }
+    }
+
     fn touch(&mut self, slot: usize) {
         if self.newest == slot {
             return;

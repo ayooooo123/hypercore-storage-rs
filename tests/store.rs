@@ -2,8 +2,11 @@
 
 use bytes::Bytes;
 use hypercore_storage::{
-    Alias, Auth, Core, CoreHead, CreateCore, Hints, InfoOptions, KeyPair, Node, Store, keys,
+    Alias, Auth, Core, CoreGroup, CoreHead, CreateCore, Hints, InfoOptions, KeyPair, Node, Store,
+    keys,
 };
+use std::sync::{Arc, Barrier, mpsc};
+use std::time::Duration;
 use tempfile::tempdir;
 
 fn discovery_key(n: u8) -> [u8; 32] {
@@ -163,59 +166,57 @@ fn counters_and_groups_follow_the_head() {
 }
 
 #[test]
-fn sessions_share_the_core_and_keep_their_own_pointer() {
+fn concurrent_creates_reuse_core_and_group_pointers() {
     let dir = tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
-    let (create, _) = core(1, [0; 32], "a");
-    let parent = store.create_core(create).unwrap();
-
-    let mut tx = parent.write();
-    tx.put_block(0, Bytes::from_static(b"genesis"));
-    tx.set_head(&CoreHead {
-        length: 1,
+    let barrier = Arc::new(Barrier::new(3));
+    let create = CreateCore {
+        key: [3; 32],
+        discovery_key: discovery_key(3),
         ..Default::default()
+    };
+    let first_store = store.clone();
+    let first_barrier = barrier.clone();
+    let first = std::thread::spawn(move || {
+        first_barrier.wait();
+        first_store.create_core(create).unwrap()
     });
-    parent.flush(tx).unwrap();
-
-    let session = parent.create_session("copy", None).unwrap();
-    assert_eq!(session.core_pointer(), parent.core_pointer());
-    assert_ne!(session.data_pointer(), parent.data_pointer());
-    assert_eq!(session.dependencies().len(), 1);
+    let second_store = store.clone();
+    let second_barrier = barrier.clone();
+    let second = std::thread::spawn(move || {
+        second_barrier.wait();
+        second_store
+            .create_core(CreateCore {
+                key: [3; 32],
+                discovery_key: discovery_key(3),
+                ..Default::default()
+            })
+            .unwrap()
+    });
+    barrier.wait();
+    let first = first.join().unwrap();
+    let second = second.join().unwrap();
     assert_eq!(
-        session.get_block(0).unwrap().as_deref(),
-        Some(&b"genesis"[..]),
-        "block comes from the parent pointer"
-    );
-    assert_eq!(session.get_head().unwrap().unwrap().length, 1);
-
-    let mut tx = session.write();
-    tx.put_block(1, Bytes::from_static(b"session"));
-    session.flush(tx).unwrap();
-    assert_eq!(
-        session.get_block(1).unwrap().as_deref(),
-        Some(&b"session"[..])
+        (first.core_pointer(), first.data_pointer()),
+        (second.core_pointer(), second.data_pointer())
     );
 
-    // A fresh handle resumes the dependency chain from the rows.
-    drop(parent);
-    drop(session);
-    store.close();
-    let store = Store::open(dir.path()).unwrap();
-    let parent = store.resume_core(&discovery_key(1)).unwrap().unwrap();
-    let sessions = parent.get_sessions().unwrap();
-    assert_eq!(sessions.len(), 1);
-    let resumed = store
-        .resume_core(&discovery_key(1))
-        .unwrap()
-        .unwrap()
-        .resume_session("copy")
-        .unwrap()
-        .unwrap();
-    assert_eq!(resumed.dependencies().len(), 1);
-    assert_eq!(
-        resumed.get_block(0).unwrap().as_deref(),
-        Some(&b"genesis"[..])
-    );
+    let group_barrier = Arc::new(Barrier::new(3));
+    let topic = [4; 32];
+    let first_store = store.clone();
+    let first_barrier = group_barrier.clone();
+    let first = std::thread::spawn(move || {
+        first_barrier.wait();
+        first_store.create_group(&topic).unwrap()
+    });
+    let second_store = store.clone();
+    let second_barrier = group_barrier.clone();
+    let second = std::thread::spawn(move || {
+        second_barrier.wait();
+        second_store.create_group(&topic).unwrap()
+    });
+    group_barrier.wait();
+    assert_eq!(first.join().unwrap(), second.join().unwrap());
 }
 
 #[test]
@@ -226,6 +227,15 @@ fn read_only_refuses_writes_and_delete_core_clears_rows() {
     let storage = store.create_core(create).unwrap();
     let mut tx = storage.write();
     tx.put_block(0, Bytes::from_static(b"x"));
+    tx.set_group(Some(CoreGroup {
+        key: Some([9; 32]),
+        pointer: 0,
+    }));
+    tx.set_head(&CoreHead {
+        timestamp: 77,
+        ..Default::default()
+    });
+    tx.put_group_update(0, 77, &[1; 32]);
     storage.flush(tx).unwrap();
     store.close();
 
@@ -252,6 +262,7 @@ fn read_only_refuses_writes_and_delete_core_clears_rows() {
     assert_eq!(store.get_alias(&alias).unwrap(), None);
     assert!(store.get(&keys::core_auth(0)).unwrap().is_none());
     assert!(store.get(&keys::data_block(0, 0)).unwrap().is_none());
+    assert!(store.group_updates(0, 0).unwrap().is_empty());
 }
 
 #[test]
@@ -275,6 +286,27 @@ fn a_key_pair_survives_and_rebuilds_the_public_half() {
     let pair = auth.key_pair.unwrap();
     assert_eq!(pair.secret_key, Some(secret));
     assert_eq!(pair.public_key, [8; 32]);
+}
+
+#[test]
+fn debug_redacts_store_and_auth_secrets() {
+    let head = hypercore_storage::StoreHead {
+        seed: Some([173; 32]),
+        ..Default::default()
+    };
+    let auth = Auth {
+        key_pair: Some(KeyPair {
+            public_key: [1; 32],
+            secret_key: Some([174; 64]),
+        }),
+        encryption_key: Some(Bytes::from_static(&[175; 32])),
+        ..Default::default()
+    };
+    let head_debug = format!("{head:?}");
+    let auth_debug = format!("{auth:?}");
+    assert!(!head_debug.contains("173"));
+    assert!(!auth_debug.contains("174"));
+    assert!(!auth_debug.contains("175"));
 }
 
 /// `gcStorage`'s compaction: a cache wipe must give the bytes back now, not after the next
@@ -372,11 +404,11 @@ fn streaming_compaction_keeps_unchanged_bottommost_tables() {
 }
 
 #[test]
-fn cached_multi_get_tracks_commits_dependencies_and_close() {
+fn cached_multi_get_tracks_commits_and_close() {
     let dir = tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     let (create, _) = core(1, [0; 32], "tree");
-    let parent = store.create_core(create).unwrap();
+    let storage = store.create_core(create).unwrap();
     let original = Node {
         index: 0,
         size: 1,
@@ -387,72 +419,114 @@ fn cached_multi_get_tracks_commits_dependencies_and_close() {
         size: 2,
         hash: [2; 32],
     };
-    let mut tx = parent.write();
+    let mut tx = storage.write();
     tx.put_tree_node(original);
     tx.put_tree_node(root);
-    tx.set_head(&CoreHead {
-        length: 2,
-        ..Default::default()
-    });
-    parent.flush(tx).unwrap();
-    let session = parent.create_session("copy", None).unwrap();
-    let own = Node {
-        index: 4,
-        size: 3,
-        hash: [3; 32],
-    };
-    let mut tx = session.write();
-    tx.put_tree_node(own);
-    session.flush(tx).unwrap();
+    storage.flush(tx).unwrap();
     assert_eq!(
-        session.get_tree_nodes(&[4, 0, 9, 1, 0]).unwrap(),
-        vec![Some(own), Some(original), None, Some(root), Some(original)]
+        storage.get_tree_nodes(&[0, 9, 1, 0]).unwrap(),
+        vec![Some(original), None, Some(root), Some(original)]
     );
-    assert_eq!(parent.get_tree_node(4).unwrap(), None);
-    assert_eq!(session.missing_tree_nodes([9, 4, 0]).unwrap(), 1);
-    assert_eq!(session.missing_tree_nodes([0, 1, 9]).unwrap(), 0);
-    assert_eq!(session.missing_tree_nodes([9, 11]).unwrap(), 2);
+    assert_eq!(storage.missing_tree_nodes([9, 0]).unwrap(), 1);
     let replacement = Node {
         hash: [4; 32],
         ..original
     };
-    let mut tx = parent.write();
+    let mut tx = storage.write();
     tx.put_tree_node(replacement);
-    parent.flush(tx).unwrap();
-    assert_eq!(session.get_tree_node(0).unwrap(), Some(replacement));
-    let mut tx = parent.write();
+    storage.flush(tx).unwrap();
+    assert_eq!(storage.get_tree_node(0).unwrap(), Some(replacement));
+    let mut tx = storage.write();
     tx.delete_tree_node(0);
-    parent.flush(tx).unwrap();
+    storage.flush(tx).unwrap();
     assert_eq!(
-        session.get_tree_nodes(&[0, 1, 4]).unwrap(),
-        vec![None, Some(root), Some(own)]
+        storage.get_tree_nodes(&[0, 1]).unwrap(),
+        vec![None, Some(root)]
     );
-    let mut tx = parent.write();
+    let mut tx = storage.write();
     tx.delete_tree_range(0, 3);
-    parent.flush(tx).unwrap();
-    assert_eq!(session.get_tree_node(1).unwrap(), None);
-    assert_eq!(session.get_tree_node(4).unwrap(), Some(own));
+    storage.flush(tx).unwrap();
+    assert_eq!(storage.get_tree_node(1).unwrap(), None);
     store.close();
     let reopened = Store::open(dir.path()).unwrap();
-    let session = reopened
-        .resume_core(&discovery_key(1))
-        .unwrap()
-        .unwrap()
-        .resume_session("copy")
-        .unwrap()
-        .unwrap();
-    assert_eq!(session.missing_tree_nodes([9, 4]).unwrap(), 1);
-    assert_eq!(
-        session.get_tree_nodes(&[4, 0, 4]).unwrap(),
-        vec![Some(own), None, Some(own)]
-    );
+    let storage = reopened.resume_core(&discovery_key(1)).unwrap().unwrap();
+    assert_eq!(storage.missing_tree_nodes([9, 1]).unwrap(), 2);
     reopened.close();
     assert!(matches!(
-        session.get_tree_node(4),
+        storage.get_tree_node(1),
         Err(hypercore_storage::Error::Closed)
     ));
     assert!(matches!(
-        session.get_tree_nodes(&[4]),
+        storage.get_tree_nodes(&[1]),
         Err(hypercore_storage::Error::Closed)
     ));
+}
+
+#[test]
+fn write_waits_for_resume_and_survives_reopen() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    store.suspend().unwrap();
+    let waiting = store.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        done_tx.send(waiting.set_seed([7; 32])).unwrap();
+    });
+    assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+    store.resume().unwrap();
+    assert_eq!(
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        [7; 32]
+    );
+    writer.join().unwrap();
+    store.close();
+    drop(store);
+
+    let reopened = Store::open(dir.path()).unwrap();
+    assert_eq!(reopened.seed().unwrap(), Some([7; 32]));
+}
+
+#[test]
+fn read_waits_for_resume() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    store.set_seed([8; 32]).unwrap();
+    store.suspend().unwrap();
+    let waiting = store.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        done_tx.send(waiting.seed()).unwrap();
+    });
+    assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+    store.resume().unwrap();
+    assert_eq!(
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        Some([8; 32])
+    );
+    reader.join().unwrap();
+}
+
+#[test]
+fn close_wakes_suspended_access_with_closed() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    store.suspend().unwrap();
+    let waiting = store.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        done_tx.send(waiting.seed()).unwrap();
+    });
+    assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+    store.close();
+    assert!(matches!(
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Err(hypercore_storage::Error::Closed)
+    ));
+    reader.join().unwrap();
 }
