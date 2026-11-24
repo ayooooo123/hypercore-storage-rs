@@ -12,7 +12,7 @@ categories = ["database", "p2p"]
 name = "hypercore_storage"
 
 [features]
-default = ["rocksdb-backend"]
+default = ["tinyrocks-backend"]
 rocksdb-backend = ["dep:rocksdb"]
 tinyrocks-backend = ["dep:tinyrocks"]
 

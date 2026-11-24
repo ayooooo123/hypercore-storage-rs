@@ -94,7 +94,13 @@ impl Store {
 
     pub fn open_read_only(dir: &Path) -> Result<Store> {
         let db_path = dir.join("db");
-        Self::from_db(db::open(&db_path, true, false, true)?, db_path, false, true, true)
+        Self::from_db(
+            db::open(&db_path, true, false, true)?,
+            db_path,
+            false,
+            true,
+            true,
+        )
     }
 
     fn from_db(
