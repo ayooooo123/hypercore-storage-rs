@@ -55,7 +55,44 @@ mod imp {
     use super::{Batch, BatchOp, COLUMN_FAMILY};
     use crate::{Error, Result};
 
-    static BLOCK_CACHE: LazyLock<Cache> = LazyLock::new(|| Cache::new_lru_cache(8 * 1024 * 1024));
+    const MIB: usize = 1024 * 1024;
+    const MIN_CACHE_MIB: usize = 8;
+    const MAX_CACHE_MIB: usize = 4096;
+
+    pub(super) fn parse_cache_mb_override(value: Option<&str>) -> Option<usize> {
+        let mb = value?.trim().parse::<usize>().ok()?;
+        Some(mb.clamp(MIN_CACHE_MIB, MAX_CACHE_MIB) * MIB)
+    }
+
+    pub(super) fn default_block_cache_bytes() -> usize {
+        if cfg!(any(target_os = "android", target_os = "ios")) {
+            8 * MIB
+        } else if cfg!(target_os = "macos") {
+            256 * MIB
+        } else {
+            512 * MIB
+        }
+    }
+
+    fn block_cache_bytes() -> usize {
+        parse_cache_mb_override(std::env::var("PEARTUBE_ROCKS_CACHE_MB").ok().as_deref())
+            .unwrap_or_else(default_block_cache_bytes)
+    }
+
+    pub(super) fn max_open_files() -> i32 {
+        if cfg!(any(target_os = "android", target_os = "ios")) {
+            48
+        } else {
+            512
+        }
+    }
+
+    // Large multi-TB relays carry 50–150+ L6 SST files whose monolithic Bloom
+    // filter + index blocks are 2–4 MiB each. Keep mobile tight at 8 MiB while
+    // giving desktop and Linux relays enough cache and file descriptors to hold
+    // active filters in RAM instead of thrashing page-cache pread64s per lookup.
+    static BLOCK_CACHE: LazyLock<Cache> =
+        LazyLock::new(|| Cache::new_lru_cache(block_cache_bytes()));
     // A large atomic batch can leave an idle DB over budget; stalling another DB deadlocks it.
     static WRITE_BUFFERS: LazyLock<WriteBufferManager> =
         LazyLock::new(|| WriteBufferManager::new_write_buffer_manager(32 * 1024 * 1024, false));
@@ -73,7 +110,7 @@ mod imp {
                 options.set_env(&env);
             }
             options.create_if_missing(!read_only);
-            options.set_max_open_files(48);
+            options.set_max_open_files(max_open_files());
             options.set_bytes_per_sync(1024 * 1024);
             options.set_max_background_jobs(if cfg!(target_os = "macos") { 4 } else { 3 });
             options.set_max_file_opening_threads(2);
@@ -235,6 +272,21 @@ mod imp {
         }
 
         #[cfg(test)]
+        pub(crate) fn open_with_stats(path: &Path) -> Result<(DB, Options)> {
+            let mut options = Options::default();
+            options.create_if_missing(false);
+            options.set_max_open_files(max_open_files());
+            options.set_bytes_per_sync(1024 * 1024);
+            options.set_max_background_jobs(if cfg!(target_os = "macos") { 4 } else { 3 });
+            options.set_max_file_opening_threads(2);
+            options.set_write_buffer_manager(&WRITE_BUFFERS);
+            options.enable_statistics();
+            let db = DB::open_cf_with_opts(&options, path, [(COLUMN_FAMILY, column_family())])
+                .map_err(|e| Error::Rocks(e.to_string()))?;
+            Ok((db, options))
+        }
+
+        #[cfg(test)]
         pub(crate) fn live_blob_file_size(&self) -> Result<u64> {
             let cf = self.cf()?;
             self.db
@@ -262,6 +314,7 @@ mod imp {
         table.set_block_size(8192);
         table.set_format_version(6);
         table.set_cache_index_and_filter_blocks(true);
+        table.set_pin_l0_filter_and_index_blocks_in_cache(true);
         table.set_bloom_filter(10.0, true);
         table.set_checksum_type(rocksdb::ChecksumType::XXH3);
         table.set_optimize_filters_for_memory(false);
@@ -524,5 +577,128 @@ mod tests {
             .expect("an idle writer must not stall another DB")
             .unwrap();
         write.join().unwrap();
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn rocksdb_cache_and_fd_budget_scales_for_non_mobile() {
+        if cfg!(any(target_os = "android", target_os = "ios")) {
+            assert_eq!(imp::default_block_cache_bytes(), 8 * 1024 * 1024);
+            assert_eq!(imp::max_open_files(), 48);
+        } else {
+            assert!(imp::default_block_cache_bytes() >= 256 * 1024 * 1024);
+            assert!(imp::max_open_files() >= 512);
+        }
+        assert_eq!(imp::parse_cache_mb_override(None), None);
+        assert_eq!(imp::parse_cache_mb_override(Some("")), None);
+        assert_eq!(imp::parse_cache_mb_override(Some("abc")), None);
+        assert_eq!(
+            imp::parse_cache_mb_override(Some("1")),
+            Some(8 * 1024 * 1024)
+        );
+        assert_eq!(
+            imp::parse_cache_mb_override(Some("512")),
+            Some(512 * 1024 * 1024)
+        );
+        assert_eq!(
+            imp::parse_cache_mb_override(Some("99999")),
+            Some(4096 * 1024 * 1024)
+        );
+        // Verify 60 distinct flushed SSTs (> old 48 max_open_files cap) stay
+        // resident across forward + reverse lookup passes with zero filter or
+        // index cache misses on the second pass.
+        let dir = tempfile::tempdir().unwrap();
+        let sst_count = 60u64;
+        {
+            let db = open(dir.path(), false, false, true).unwrap();
+            db.set_test_blob_file_size(256 * 1024 * 1024).unwrap();
+            for sst in 0..sst_count {
+                let mut b = Batch::default();
+                for i in 0u64..128 {
+                    let key = format!("sst-{sst:03}-key-{i:04}");
+                    b.put(key.into_bytes(), vec![sst as u8; 128]);
+                }
+                db.write_batch(b).unwrap();
+                db.flush().unwrap();
+            }
+        }
+        let (db, opts) = imp::Backend::open_with_stats(dir.path()).unwrap();
+        let cf = db.cf_handle(COLUMN_FAMILY).unwrap();
+        // Warm all 60 table readers and their filter/index blocks.
+        for sst in 0..sst_count {
+            let key = format!("sst-{sst:03}-key-0001");
+            assert_eq!(
+                db.get_cf(cf, key.as_bytes()).unwrap().unwrap(),
+                vec![sst as u8; 128]
+            );
+        }
+        let filter_miss_before =
+            opts.get_ticker_count(rocksdb::statistics::Ticker::BlockCacheFilterMiss);
+        let index_miss_before =
+            opts.get_ticker_count(rocksdb::statistics::Ticker::BlockCacheIndexMiss);
+        let filter_hit_before =
+            opts.get_ticker_count(rocksdb::statistics::Ticker::BlockCacheFilterHit);
+        // Reverse pass over a different key in every SST: an LRU table/block
+        // cache smaller than 60 SSTs evicts entries and causes misses here.
+        for sst in (0..sst_count).rev() {
+            let key = format!("sst-{sst:03}-key-0100");
+            assert_eq!(
+                db.get_cf(cf, key.as_bytes()).unwrap().unwrap(),
+                vec![sst as u8; 128]
+            );
+        }
+        let filter_miss_after =
+            opts.get_ticker_count(rocksdb::statistics::Ticker::BlockCacheFilterMiss);
+        let index_miss_after =
+            opts.get_ticker_count(rocksdb::statistics::Ticker::BlockCacheIndexMiss);
+        let filter_hit_after =
+            opts.get_ticker_count(rocksdb::statistics::Ticker::BlockCacheFilterHit);
+        if !cfg!(any(target_os = "android", target_os = "ios")) {
+            assert_eq!(
+                filter_miss_after, filter_miss_before,
+                "60-SST reverse lookup pass thrashed Bloom filter blocks out of cache"
+            );
+            assert_eq!(
+                index_miss_after, index_miss_before,
+                "60-SST reverse lookup pass thrashed index blocks out of cache"
+            );
+            assert!(
+                filter_hit_after > filter_hit_before,
+                "expected filter cache hits on second pass"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_sst_forward_and_reverse_lookups_return_exact_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let sst_count = 60u64;
+        {
+            let db = open(dir.path(), false, false, true).unwrap();
+            for sst in 0..sst_count {
+                let mut b = Batch::default();
+                for i in 0u64..16 {
+                    let key = format!("multi-{sst:03}-key-{i:03}");
+                    b.put(key.into_bytes(), vec![sst as u8; 64]);
+                }
+                db.write_batch(b).unwrap();
+                db.flush().unwrap();
+            }
+        }
+        let db = open(dir.path(), true, false, true).unwrap();
+        for sst in 0..sst_count {
+            let key = format!("multi-{sst:03}-key-001");
+            assert_eq!(
+                db.get(key.as_bytes()).unwrap().unwrap(),
+                vec![sst as u8; 64]
+            );
+        }
+        for sst in (0..sst_count).rev() {
+            let key = format!("multi-{sst:03}-key-015");
+            assert_eq!(
+                db.get(key.as_bytes()).unwrap().unwrap(),
+                vec![sst as u8; 64]
+            );
+        }
     }
 }
