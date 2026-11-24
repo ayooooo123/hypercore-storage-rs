@@ -26,6 +26,10 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/hyperschema-rs
           path: hyperschema-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/tinyrocks-rs
+          path: tinyrocks-rs
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -36,3 +40,4 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test -- --include-ignored
+      - run: cargo test --no-default-features --features rocksdb-backend

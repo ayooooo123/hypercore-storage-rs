@@ -66,12 +66,7 @@ mod imp {
     }
 
     impl Backend {
-        pub(crate) fn open(
-            path: &Path,
-            read_only: bool,
-            memory: bool,
-            wal: bool,
-        ) -> Result<Self> {
+        pub(crate) fn open(path: &Path, read_only: bool, memory: bool, wal: bool) -> Result<Self> {
             let mut options = Options::default();
             if memory {
                 let env = rocksdb::Env::mem_env().map_err(|e| Error::Rocks(e.to_string()))?;
@@ -309,12 +304,7 @@ mod imp {
     }
 
     impl Backend {
-        pub(crate) fn open(
-            path: &Path,
-            read_only: bool,
-            memory: bool,
-            wal: bool,
-        ) -> Result<Self> {
+        pub(crate) fn open(path: &Path, read_only: bool, memory: bool, wal: bool) -> Result<Self> {
             let mut db = if memory {
                 // Match rust-rocksdb MemEnv behavior (creates empty directory, writes no files).
                 std::fs::create_dir_all(path)?;
@@ -364,7 +354,12 @@ mod imp {
             self.db
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .scan_cf(COLUMN_FAMILY, Some(start), Some(end), ScanDirection::Forward)
+                .scan_cf(
+                    COLUMN_FAMILY,
+                    Some(start),
+                    Some(end),
+                    ScanDirection::Forward,
+                )
                 .map_err(|e| Error::Rocks(e.to_string()))
         }
 
@@ -376,7 +371,12 @@ mod imp {
             self.db
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .scan_cf(COLUMN_FAMILY, Some(start), Some(end), ScanDirection::Reverse)
+                .scan_cf(
+                    COLUMN_FAMILY,
+                    Some(start),
+                    Some(end),
+                    ScanDirection::Reverse,
+                )
                 .map_err(|e| Error::Rocks(e.to_string()))
         }
 
