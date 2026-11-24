@@ -10,12 +10,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use bytes::Bytes;
 use compact_encoding::hypercore::Node;
 use compact_encoding::{Reader, Writer};
-use rocksdb::{
-    BottommostLevelCompaction, ColumnFamily, CompactOptions, DB, IteratorMode, ReadOptions,
-    WriteBatch, WriteOptions,
-};
 
-use crate::db::{self, COLUMN_FAMILY};
+use crate::db::{self, Backend, Batch};
 use crate::keys;
 use crate::rows::{
     Alias, Auth, Core, CoreGroup, CoreHead, GroupRow, Hints, Info, Session, StoreHead,
@@ -56,11 +52,11 @@ pub struct Store {
 struct Inner {
     /// An `Arc` so a compaction can drop the lock while it rewrites files, instead of
     /// blocking every read that needs the same handle.
-    db: Mutex<Option<Arc<DB>>>,
+    db: Mutex<Option<Arc<Backend>>>,
     db_path: PathBuf,
     memory: bool,
     read_only: bool,
-    write_options: WriteOptions,
+    wal: bool,
     closed: AtomicBool,
     closed_rx: tokio::sync::watch::Sender<bool>,
     /// Database accesses hold it shared; suspend, resume and close hold it exclusively.
@@ -86,36 +82,35 @@ impl Store {
             std::fs::create_dir_all(dir)?;
         }
         let db_path = dir.join("db");
+        let wal = options.wal && !options.memory;
         Self::from_db(
-            db::open_with_memory(&db_path, false, options.memory)?,
+            db::open(&db_path, false, options.memory, wal)?,
             db_path,
             options.memory,
             false,
-            options.wal && !options.memory,
+            wal,
         )
     }
 
     pub fn open_read_only(dir: &Path) -> Result<Store> {
         let db_path = dir.join("db");
-        Self::from_db(db::open(&db_path, true)?, db_path, false, true, true)
+        Self::from_db(db::open(&db_path, true, false, true)?, db_path, false, true, true)
     }
 
     fn from_db(
-        db: DB,
+        db: Backend,
         db_path: PathBuf,
         memory: bool,
         read_only: bool,
         wal: bool,
     ) -> Result<Store> {
-        let mut write_options = WriteOptions::default();
-        write_options.disable_wal(!wal);
         Ok(Store {
             inner: Arc::new(Inner {
                 db: Mutex::new(Some(Arc::new(db))),
                 db_path,
                 memory,
                 read_only,
-                write_options,
+                wal,
                 closed: AtomicBool::new(false),
                 closed_rx: tokio::sync::watch::channel(false).0,
                 access_gate: RwLock::new(()),
@@ -184,12 +179,8 @@ impl Store {
             return Ok(());
         }
         let db = self.handle()?;
-        let cf = db
-            .cf_handle(COLUMN_FAMILY)
-            .ok_or_else(|| Error::Corrupt("missing corestore column family".into()))?;
-        db.flush_wal(true)
-            .map_err(|e| Error::Rocks(e.to_string()))?;
-        db.flush_cf(&cf).map_err(|e| Error::Rocks(e.to_string()))?;
+        db.flush_wal(true)?;
+        db.flush()?;
         let closed_db = self.lock_db().take();
         *suspended = true;
         drop(db);
@@ -197,7 +188,7 @@ impl Store {
         Ok(())
     }
 
-    /// Reopens RocksDB after [`Store::suspend`] and wakes waiting accesses.
+    /// Reopens the backend after [`Store::suspend`] and wakes waiting accesses.
     ///
     /// The host must call this from a thread that is not blocked in a store access.
     pub fn resume(&self) -> Result<()> {
@@ -220,11 +211,12 @@ impl Store {
         if !*suspended {
             return Ok(());
         }
-        let db = if self.inner.read_only {
-            db::open(&self.inner.db_path, true)?
-        } else {
-            db::open_with_memory(&self.inner.db_path, false, self.inner.memory)?
-        };
+        let db = db::open(
+            &self.inner.db_path,
+            self.inner.read_only,
+            self.inner.memory,
+            self.inner.wal,
+        )?;
         *self.lock_db() = Some(Arc::new(db));
         *suspended = false;
         self.inner.resumed.notify_all();
@@ -233,7 +225,7 @@ impl Store {
 
     /// Flushes the memtable, as JS `storage.flush()` does.
     pub fn flush(&self) -> Result<()> {
-        self.with_db(|db, cf| db.flush_cf(cf).map_err(|e| Error::Rocks(e.to_string())))
+        self.with_db(|db| db.flush())
     }
 
     /// Rewrites the SSTs and `.blob` files now, as JS `coreStorage.compact(options)` does, so
@@ -249,64 +241,17 @@ impl Store {
         let _access = self.access_gate()?;
         let _compact = self.inner.compact.lock().unwrap_or_else(|e| e.into_inner());
         let db = self.handle()?;
-        let cf = db
-            .cf_handle(COLUMN_FAMILY)
-            .ok_or_else(|| Error::Corrupt("missing corestore column family".into()))?;
-        // shortcut: CF-wide GC override until the Rust binding exposes per-compaction GC options.
-        db.set_options_cf(
-            &cf,
-            &[
-                ("enable_blob_garbage_collection", "true"),
-                (
-                    "blob_garbage_collection_age_cutoff",
-                    if relocate_blobs { "1.0" } else { "0.0" },
-                ),
-            ],
-        )
-        .map_err(|e| Error::Rocks(e.to_string()))?;
-        let mut options = CompactOptions::default();
-        options.set_exclusive_manual_compaction(relocate_blobs);
-        options.set_bottommost_level_compaction(if relocate_blobs {
-            BottommostLevelCompaction::Force
-        } else {
-            BottommostLevelCompaction::Skip
-        });
-        db.compact_range_cf_opt(&cf, None::<&[u8]>, None::<&[u8]>, &options);
-        if !relocate_blobs {
-            let size = db
-                .property_int_value_cf(&cf, "rocksdb.live-blob-file-size")
-                .map_err(|e| Error::Rocks(e.to_string()))?
-                .unwrap_or(0);
-            let garbage = db
-                .property_int_value_cf(&cf, "rocksdb.live-blob-file-garbage-size")
-                .map_err(|e| Error::Rocks(e.to_string()))?
-                .unwrap_or(0);
-            if garbage > 0 && garbage >= size.div_ceil(4) {
-                db.set_options_cf(&cf, &[("blob_garbage_collection_age_cutoff", "1.0")])
-                    .map_err(|e| Error::Rocks(e.to_string()))?;
-                options.set_bottommost_level_compaction(BottommostLevelCompaction::Force);
-                db.compact_range_cf_opt(&cf, None::<&[u8]>, None::<&[u8]>, &options);
-            }
-        }
-        db.set_options_cf(
-            &cf,
-            &[
-                ("enable_blob_garbage_collection", "true"),
-                ("blob_garbage_collection_age_cutoff", "0.0"),
-            ],
-        )
-        .map_err(|e| Error::Rocks(e.to_string()))?;
-        Ok(())
+        db.compact(relocate_blobs)
     }
 
-    fn lock_db(&self) -> MutexGuard<'_, Option<Arc<DB>>> {
+    fn lock_db(&self) -> MutexGuard<'_, Option<Arc<Backend>>> {
         self.inner
             .db
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    fn handle(&self) -> Result<Arc<DB>> {
+    fn handle(&self) -> Result<Arc<Backend>> {
         self.lock_db().as_ref().cloned().ok_or(Error::Closed)
     }
 
@@ -354,51 +299,36 @@ impl Store {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    fn with_db<T>(&self, f: impl FnOnce(&DB, &ColumnFamily) -> Result<T>) -> Result<T> {
+    fn with_db<T>(&self, f: impl FnOnce(&Backend) -> Result<T>) -> Result<T> {
         let _access = self.access_gate()?;
         let db = self.handle()?;
-        let cf = db
-            .cf_handle(COLUMN_FAMILY)
-            .ok_or_else(|| Error::Corrupt("missing corestore column family".into()))?;
-        f(&db, cf)
+        f(&db)
     }
 
     /// Reads one row.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        self.with_db(|db, cf| {
-            db.get_cf(cf, key)
-                .map(|value| value.map(Bytes::from))
-                .map_err(|e| Error::Rocks(e.to_string()))
-        })
+        self.with_db(|db| db.get(key).map(|value| value.map(Bytes::from)))
     }
 
     /// Reads a `[start, end)` key range in ascending order.
     pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
-        self.with_db(|db, cf| {
-            let mut options = ReadOptions::default();
-            options.set_iterate_lower_bound(start.to_vec());
-            options.set_iterate_upper_bound(end.to_vec());
-            let mut out = Vec::new();
-            for item in db.iterator_cf_opt(cf, options, IteratorMode::Start) {
-                let (key, value) = item.map_err(|e| Error::Rocks(e.to_string()))?;
-                out.push((key.to_vec(), Bytes::from(value.to_vec())));
-            }
-            Ok(out)
+        self.with_db(|db| {
+            Ok(db
+                .range(start, end)?
+                .into_iter()
+                .map(|(k, v)| (k, Bytes::from(v)))
+                .collect())
         })
     }
 
     /// Reads a whole tag/pointer range in descending order (group updates).
     pub fn range_reverse(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
-        self.with_db(|db, cf| {
-            let mut options = ReadOptions::default();
-            options.set_iterate_lower_bound(start.to_vec());
-            options.set_iterate_upper_bound(end.to_vec());
-            let mut out = Vec::new();
-            for item in db.iterator_cf_opt(cf, options, IteratorMode::End) {
-                let (key, value) = item.map_err(|e| Error::Rocks(e.to_string()))?;
-                out.push((key.to_vec(), Bytes::from(value.to_vec())));
-            }
-            Ok(out)
+        self.with_db(|db| {
+            Ok(db
+                .range_reverse(start, end)?
+                .into_iter()
+                .map(|(k, v)| (k, Bytes::from(v)))
+                .collect())
         })
     }
 
@@ -410,33 +340,30 @@ impl Store {
         if self.inner.read_only {
             return Err(Error::ReadOnly);
         }
-        self.with_db(|db, cf| {
-            let mut batch = WriteBatch::default();
+        self.with_db(|db| {
+            let mut batch = Batch::default();
             for op in &ops {
                 match op {
-                    Op::Put(key, value) => batch.put_cf(cf, key, value),
-                    Op::PutTree(pointer, node) => batch.put_cf(
-                        cf,
+                    Op::Put(key, value) => batch.put(key.clone(), value.to_vec()),
+                    Op::PutTree(pointer, node) => batch.put(
                         keys::data_tree(*pointer, node.index),
                         crate::rows::encode_tree_node(node),
                     ),
-                    Op::Delete(key) => batch.delete_cf(cf, key),
-                    Op::DeleteRange(start, end) => batch.delete_range_cf(cf, start, end),
+                    Op::Delete(key) => batch.delete(key.clone()),
+                    Op::DeleteRange(start, end) => batch.delete_range(start.clone(), end.clone()),
                     Op::DeleteTree(pointer, index) => {
-                        batch.delete_cf(cf, keys::data_tree(*pointer, *index))
+                        batch.delete(keys::data_tree(*pointer, *index))
                     }
-                    Op::DeleteTreeRange(pointer, start, end) => batch.delete_range_cf(
-                        cf,
+                    Op::DeleteTreeRange(pointer, start, end) => batch.delete_range(
                         keys::data_tree(*pointer, *start),
                         keys::data_tree(*pointer, *end),
                     ),
-                    Op::DeleteTreeAll(pointer) => batch.delete_range_cf(
-                        cf,
+                    Op::DeleteTreeAll(pointer) => batch.delete_range(
                         keys::data_tree_start(*pointer),
                         keys::data_bitfield_start(*pointer),
                     ),
                     Op::Clear => {
-                        batch.delete_range_cf(cf, keys::uint_key(0), keys::uint_key(keys::TL_END))
+                        batch.delete_range(keys::uint_key(0), keys::uint_key(keys::TL_END))
                     }
                 }
             }
@@ -455,8 +382,7 @@ impl Store {
                         .unwrap_or_else(|e| e.into_inner())
                 })
             });
-            db.write_opt(batch, &self.inner.write_options)
-                .map_err(|e| Error::Rocks(e.to_string()))?;
+            db.write_batch(batch)?;
             let mut cache = self.tree_cache();
             for op in ops {
                 match op {
@@ -1013,7 +939,7 @@ impl CoreStorage {
 
     /// Tree node `index`.
     pub fn get_tree_node(&self, index: u64) -> Result<Option<Node>> {
-        self.store.with_db(|db, cf| {
+        self.store.with_db(|db| {
             let _read = self.store.inner.tree_io[tree_lock(self.data_pointer)]
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
@@ -1021,8 +947,7 @@ impl CoreStorage {
                 return Ok(Some(node));
             }
             let node = db
-                .get_cf(cf, keys::data_tree(self.data_pointer, index))
-                .map_err(|e| Error::Rocks(e.to_string()))?
+                .get(&keys::data_tree(self.data_pointer, index))?
                 .map(|bytes| crate::rows::decode_tree_node(Bytes::from(bytes)))
                 .transpose()?;
             if let Some(node) = node {
@@ -1042,9 +967,9 @@ impl CoreStorage {
         })
     }
 
-    /// Ordered tree reads in one RocksDB multi-get; cached nodes need no I/O.
+    /// Ordered tree reads in one multi-get; cached nodes need no I/O.
     pub fn get_tree_nodes(&self, indices: &[u64]) -> Result<Vec<Option<Node>>> {
-        self.store.with_db(|db, cf| {
+        self.store.with_db(|db| {
             let _reads = self.tree_reads();
             let mut cache = self.store.tree_cache();
             let mut out = Vec::with_capacity(indices.len());
@@ -1060,14 +985,10 @@ impl CoreStorage {
             }
             drop(cache);
             if !missing.is_empty() {
-                let values = if row_keys.len() == 1 {
-                    vec![db.get_cf(cf, &row_keys[0])]
-                } else {
-                    db.multi_get_cf(row_keys.iter().map(|key| (cf, key)))
-                };
+                let values = db.multi_get(&row_keys)?;
                 let mut cache = self.store.tree_cache();
                 for (slot, value) in missing.into_iter().zip(values) {
-                    if let Some(bytes) = value.map_err(|e| Error::Rocks(e.to_string()))? {
+                    if let Some(bytes) = value {
                         let node = crate::rows::decode_tree_node(Bytes::from(bytes))?;
                         cache.put(self.data_pointer, node);
                         out[slot] = Some(node);
@@ -1080,7 +1001,7 @@ impl CoreStorage {
 
     /// Missing prefix of an ancestor path, stopping at the first cached or persisted node.
     pub fn missing_tree_nodes(&self, indices: impl IntoIterator<Item = u64>) -> Result<u64> {
-        self.store.with_db(|db, cf| {
+        self.store.with_db(|db| {
             let _reads = self.tree_reads();
             let mut cache = self.store.tree_cache();
             let mut row_keys = Vec::new();
@@ -1094,13 +1015,9 @@ impl CoreStorage {
             if row_keys.is_empty() {
                 return Ok(0);
             }
-            let values = if row_keys.len() == 1 {
-                vec![db.get_cf(cf, &row_keys[0])]
-            } else {
-                db.multi_get_cf(row_keys.iter().map(|key| (cf, key)))
-            };
+            let values = db.multi_get(&row_keys)?;
             for (slot, value) in values.into_iter().enumerate() {
-                if let Some(bytes) = value.map_err(|e| Error::Rocks(e.to_string()))? {
+                if let Some(bytes) = value {
                     let node = crate::rows::decode_tree_node(Bytes::from(bytes))?;
                     self.store.tree_cache().put(self.data_pointer, node);
                     return Ok(slot as u64);
@@ -1381,15 +1298,7 @@ mod tests {
             storage.flush(tx).unwrap();
             store.flush().unwrap();
         }
-        let blob_bytes = || {
-            store
-                .with_db(|db, cf| {
-                    db.property_int_value_cf(cf, "rocksdb.live-blob-file-size")
-                        .map(|bytes| bytes.unwrap_or(0))
-                        .map_err(|e| Error::Rocks(e.to_string()))
-                })
-                .unwrap()
-        };
+        let blob_bytes = || store.with_db(|db| db.live_blob_file_size()).unwrap();
         let before = blob_bytes();
         assert!(before > 0);
         let mut tx = storage.write();
@@ -1450,16 +1359,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         store
-            .with_db(|db, cf| {
-                db.set_options_cf(
-                    cf,
-                    &[
-                        ("blob_file_size", "4194304"),
-                        ("disable_auto_compactions", "true"),
-                    ],
-                )
-                .map_err(|e| Error::Rocks(e.to_string()))
-            })
+            .with_db(|db| db.set_test_blob_file_size(4_194_304))
             .unwrap();
         let storage = store
             .create_core(CreateCore {
