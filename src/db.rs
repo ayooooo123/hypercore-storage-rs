@@ -368,10 +368,14 @@ mod imp {
                 Db::open_rw(path, &[COLUMN_FAMILY]).map_err(|e| Error::Rocks(e.to_string()))?
             };
             db.set_write_buffer_size(if cfg!(target_os = "macos") {
-                32 * 1024 * 1024
+                64 * 1024 * 1024
             } else {
                 12 * 1024 * 1024
             });
+            // Match stock RocksDB's default (`use_fsync = false`, `WriteOptions::sync = false`):
+            // routine cache flushes write through the OS page cache without per-flush
+            // `F_FULLFSYNC` NVMe stalls; explicit `flush_wal(true)` on suspend/close still syncs.
+            db.set_sync_on_flush(false);
             let cf_id = db
                 .cf_id(COLUMN_FAMILY)
                 .map_err(|e| Error::Rocks(e.to_string()))?;
